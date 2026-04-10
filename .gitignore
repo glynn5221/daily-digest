@@ -1,2 +1,5 @@
 config.json
 state.json
+daemon/*.log
+last-digest.md
+run.log
