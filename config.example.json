@@ -1,0 +1,74 @@
+{
+  "user": {
+    "name": "Your Name",
+    "slack_id": "U0XXXXXXXXX",
+    "role": "Your role and coverage area",
+    "company": "Block",
+    "timezone": "EST"
+  },
+  "coverage": {
+    "description": "Brief description of what you cover — used to guide ranking and relevance filtering",
+    "slack_searches": [
+      "keyword1 keyword2",
+      "\"exact phrase\"",
+      "topic1 topic2"
+    ],
+    "drive_search_terms": [
+      "keyword1",
+      "keyword2"
+    ],
+    "topics": [
+      "Topic A",
+      "Topic B"
+    ],
+    "vocabulary": [
+      "ACRONYM1",
+      "ACRONYM2"
+    ],
+    "key_people": [
+      "Person One",
+      "Person Two"
+    ]
+  },
+  "ranking": {
+    "financial_impact": [
+      "P0/P1 projects blocked, unstaffed, or past deadline",
+      "Revenue/cost drivers for your coverage area",
+      "Regulatory items (add your relevant regulators)",
+      "Staffing gaps on critical work",
+      "Slack/Drive signals of financial risk or opportunity"
+    ],
+    "personal_relevance": [
+      "Your team's products and initiatives",
+      "Items involving your key_people list",
+      "Cross-functional decisions affecting your function",
+      "Regulatory items not already in financial impact list"
+    ]
+  },
+  "sources": {
+    "airtable": {
+      "base_id": "appXXXXXXXXXXXXX",
+      "base_name": "Your Airtable Base Name",
+      "fields": [
+        "Name",
+        "Status",
+        "Priority",
+        "Expected Completion Date",
+        "Notes"
+      ]
+    },
+    "slack": {
+      "workspace_id": "T0XXXXXXXXX"
+    },
+    "google_drive": {
+      "keychain_service": "mcp_google_drive",
+      "keychain_account": "oauth_token_gdrive",
+      "oauth_client_id": "your-client-id.apps.googleusercontent.com",
+      "oauth_client_secret": "GOCSPX-your-client-secret"
+    }
+  },
+  "credentials": {
+    "slack_token": "xoxp-your-slack-token",
+    "claude_config_path": "/Users/yourname/.claude.json"
+  }
+}
