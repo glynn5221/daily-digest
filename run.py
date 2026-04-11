@@ -134,17 +134,14 @@ def fetch_airtable(config):
 
 # ── Slack ─────────────────────────────────────────────────────────────────
 
-def fetch_slack(config):
-    """Search Slack via API."""
-    token = config["credentials"]["slack_token"]
-    queries = config["coverage"]["slack_searches"]
+def _slack_search(token, workspace_id, queries, label="Slack"):
+    """Run a list of Slack search queries and return deduplicated messages."""
     all_messages = []
 
     for query in queries:
         full_query = f"{query} after:yesterday"
-        log(f"  Slack search: {full_query}")
+        log(f"  {label} search: {full_query}")
 
-        workspace_id = config["sources"]["slack"].get("workspace_id", "")
         search_params = {"query": full_query, "count": "20"}
         if workspace_id:
             search_params["team_id"] = workspace_id
@@ -156,12 +153,11 @@ def fetch_slack(config):
             resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
 
             if not resp.get("ok"):
-                log(f"  Warning: Slack search failed: {resp.get('error', 'unknown')}")
+                log(f"  Warning: {label} search failed: {resp.get('error', 'unknown')}")
                 continue
 
             matches = resp.get("messages", {}).get("matches", [])
             for m in matches:
-                # Skip bot messages
                 if m.get("bot_id") or m.get("subtype") == "bot_message":
                     continue
                 text = m.get("text", "").strip()
@@ -175,7 +171,7 @@ def fetch_slack(config):
                     "query": query
                 })
         except Exception as e:
-            log(f"  Warning: Slack search failed for '{query}': {e}")
+            log(f"  Warning: {label} search failed for '{query}': {e}")
 
     # Deduplicate by timestamp
     seen = set()
@@ -185,16 +181,34 @@ def fetch_slack(config):
             seen.add(m["ts"])
             unique.append(m)
 
-    log(f"  Slack: {len(unique)} unique messages from {len(queries)} searches")
+    log(f"  {label}: {len(unique)} unique messages from {len(queries)} searches")
     return unique
+
+
+def fetch_slack(config):
+    """Search Slack for user's coverage area."""
+    token = config["credentials"]["slack_token"]
+    workspace_id = config["sources"]["slack"].get("workspace_id", "")
+    queries = config["coverage"]["slack_searches"]
+    return _slack_search(token, workspace_id, queries, "Slack")
+
+
+def fetch_slack_company_bets(config):
+    """Search Slack for company-wide trajectory-changing initiatives."""
+    bets = config.get("company_bets", {})
+    if not bets or not bets.get("slack_searches"):
+        return []
+    token = config["credentials"]["slack_token"]
+    workspace_id = config["sources"]["slack"].get("workspace_id", "")
+    return _slack_search(token, workspace_id, bets["slack_searches"], "Bets")
 
 
 # ── Google Drive ──────────────────────────────────────────────────────────
 
-def fetch_google_drive(config):
+def fetch_google_drive(config, override_terms=None, label="Drive"):
     """Search Google Drive via API with OAuth refresh."""
     gd = config["sources"]["google_drive"]
-    terms = config["coverage"]["drive_search_terms"]
+    terms = override_terms or config["coverage"]["drive_search_terms"]
 
     # Get refresh token from keychain
     try:
@@ -238,7 +252,7 @@ def fetch_google_drive(config):
             "pageSize": "10"
         })
         url = f"https://www.googleapis.com/drive/v3/files?{params}"
-        log(f"  Drive search: {term}")
+        log(f"  {label} search: {term}")
 
         try:
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
@@ -268,7 +282,7 @@ def fetch_google_drive(config):
             seen.add(d["id"])
             unique.append(d)
 
-    log(f"  Drive: {len(unique)} unique docs from {len(terms)} searches")
+    log(f"  {label}: {len(unique)} unique docs from {len(terms)} searches")
     return {"docs": unique}
 
 
@@ -309,7 +323,7 @@ def send_slack_dm(config, message):
 
 # ── Claude synthesis ──────────────────────────────────────────────────────
 
-def synthesize(config, state, airtable_data, slack_data, drive_data):
+def synthesize(config, state, airtable_data, slack_data, drive_data, bets_slack_data, bets_drive_data):
     """Pass raw data to claude -p for synthesis."""
     run_count = state.get("run_count", 0)
     mode = "BASELINE" if run_count < 3 else "DELTA"
@@ -338,16 +352,25 @@ Mode: {mode}
 ## Ranking criteria — Personal Relevance
 {chr(10).join('- ' + c for c in config['ranking']['personal_relevance'])}
 
+## Ranking criteria — Company Trajectory (big bets, company-changing initiatives)
+{chr(10).join('- ' + c for c in config.get('company_bets', {}).get('criteria', []))}
+
 {"## Previous snapshot (for delta comparison)" + chr(10) + prev_snapshot if mode == "DELTA" else ""}
 
 ## RAW DATA — Airtable ({len(airtable_data.get('records', []))} records)
 {json.dumps(airtable_data, indent=1, default=str)[:15000]}
 
-## RAW DATA — Slack ({len(slack_data)} messages)
-{json.dumps(slack_data, indent=1, default=str)[:15000]}
+## RAW DATA — Slack ({len(slack_data)} messages from user's coverage area)
+{json.dumps(slack_data, indent=1, default=str)[:12000]}
 
-## RAW DATA — Google Drive ({len(drive_data.get('docs', []))} docs)
-{json.dumps(drive_data, indent=1, default=str)[:8000]}
+## RAW DATA — Slack Company Bets ({len(bets_slack_data)} messages from company-wide searches)
+{json.dumps(bets_slack_data, indent=1, default=str)[:10000]}
+
+## RAW DATA — Google Drive ({len(drive_data.get('docs', []))} docs from user's coverage area)
+{json.dumps(drive_data, indent=1, default=str)[:6000]}
+
+## RAW DATA — Google Drive Company Bets ({len(bets_drive_data.get('docs', []))} docs from company-wide searches)
+{json.dumps(bets_drive_data, indent=1, default=str)[:5000]}
 
 ## Instructions
 
@@ -366,13 +389,20 @@ Produce the digest in this exact format (Slack mrkdwn):
 [up to 10 items]
 
 ---
+
+*🚀 Top 5: Company Trajectory*
+
+[up to 5 items — trajectory-changing initiatives and big bets across the ENTIRE company, NOT limited to the user's coverage area. Think: new markets, new product lines, major sales motion shifts, AI/ML bets, strategic partnerships, major org changes, competitive responses. These should be the things that could change the company's trajectory over the next 1-3 years.]
+
+---
 _Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if not drive_data.get('error') else '❌'} · Sent by Claude_
 
 Rules:
 - Each item format: [N]. 🔴/🟡/🟢 *[Item name]* _(Airtable/Slack/Drive)_  then 2-3 sentences
 - 🔴 = action today, 🟡 = monitor, 🟢 = positive signal
 - Lead with "so what" and financial impact, not metadata
-- No duplicates between the two lists
+- No duplicates across ANY of the three sections
+- Company Trajectory items should be DIFFERENT from Financial Impact and On Your Radar — broader, more strategic, company-wide
 - If {mode} is DELTA, only include genuine changes vs the previous snapshot
 - Output ONLY the formatted digest, nothing else
 """
@@ -422,16 +452,23 @@ def main():
     airtable_data = fetch_airtable(config)
     airtable_ok = "error" not in airtable_data
 
-    log("Fetching Slack...")
+    log("Fetching Slack (coverage area)...")
     slack_data = fetch_slack(config)
     slack_ok = len(slack_data) > 0
 
-    log("Fetching Google Drive...")
+    log("Fetching Slack (company bets)...")
+    bets_slack_data = fetch_slack_company_bets(config)
+
+    log("Fetching Google Drive (coverage area)...")
     drive_data = fetch_google_drive(config)
     drive_ok = "error" not in drive_data
 
+    log("Fetching Google Drive (company bets)...")
+    bets_drive_terms = config.get("company_bets", {}).get("drive_search_terms", [])
+    bets_drive_data = fetch_google_drive(config, override_terms=bets_drive_terms, label="Bets Drive") if bets_drive_terms else {"docs": []}
+
     # Synthesize with Claude
-    digest = synthesize(config, state, airtable_data, slack_data, drive_data)
+    digest = synthesize(config, state, airtable_data, slack_data, drive_data, bets_slack_data, bets_drive_data)
 
     if not digest:
         log("ERROR: Synthesis failed — no digest produced")

@@ -45,6 +45,29 @@
       "Regulatory items not already in financial impact list"
     ]
   },
+  "company_bets": {
+    "description": "Trajectory-changing initiatives and big bets across the entire company",
+    "slack_searches": [
+      "international expansion global launch",
+      "AI agent copilot machine learning",
+      "acquisition partnership strategic",
+      "reorg restructuring leadership change"
+    ],
+    "drive_search_terms": [
+      "international expansion",
+      "AI strategy",
+      "big bet",
+      "company trajectory"
+    ],
+    "criteria": [
+      "New markets or geographies",
+      "New product lines that could become revenue pillars",
+      "Major sales motion changes",
+      "AI/ML initiatives that change how the company operates",
+      "Strategic partnerships or acquisitions",
+      "Major org changes or leadership moves"
+    ]
+  },
   "sources": {
     "airtable": {
       "base_id": "appXXXXXXXXXXXXX",
