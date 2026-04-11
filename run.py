@@ -392,7 +392,7 @@ Produce the digest in this exact format (Slack mrkdwn):
 
 *🚀 Top 5: Company Trajectory*
 
-[up to 5 items — trajectory-changing initiatives and big bets across the ENTIRE company, NOT limited to the user's coverage area. Think: new markets, new product lines, major sales motion shifts, AI/ML bets, strategic partnerships, major org changes, competitive responses. These should be the things that could change the company's trajectory over the next 1-3 years.]
+[up to 5 items — trajectory-changing initiatives and big bets across the ENTIRE company, NOT limited to the user's coverage area. Use your judgment broadly. The configured search terms are just starting points — surface anything from ANY of the raw data that could meaningfully change Block's trajectory over the next 1-3 years. Examples: international expansion (Cash App Lite), new financial products (credit score, banking), major sales motion shifts (field sales, enterprise GTM), AI/ML bets that change how the company operates or competes, bitcoin/crypto strategic moves, strategic partnerships or acquisitions, major org restructuring or senior leadership changes, competitive threats that force a response, new regulatory regimes, large customer segment expansions. Cast a wide net — if it could move the stock price or fundamentally alter Block's competitive position, it belongs here.]
 
 ---
 _Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if not drive_data.get('error') else '❌'} · Sent by Claude_
@@ -402,7 +402,7 @@ Rules:
 - 🔴 = action today, 🟡 = monitor, 🟢 = positive signal
 - Lead with "so what" and financial impact, not metadata
 - No duplicates across ANY of the three sections
-- Company Trajectory items should be DIFFERENT from Financial Impact and On Your Radar — broader, more strategic, company-wide
+- Company Trajectory items should be DIFFERENT from Financial Impact and On Your Radar — broader, more strategic, company-wide. They can come from ANY raw data source, not just the company bets searches. If a Slack message about a coverage-area topic also reveals a company-changing bet, put it in Trajectory.
 - If {mode} is DELTA, only include genuine changes vs the previous snapshot
 - Output ONLY the formatted digest, nothing else
 """
