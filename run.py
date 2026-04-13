@@ -400,7 +400,29 @@ Mode: {mode}
 ## Key people (items involving these people are personally relevant)
 {', '.join(config['coverage']['key_people'])}
 
-## Ranking criteria — For Your Role (combines financial impact + personal relevance)
+## What matters for "For Your Role" — ONLY include items that match these criteria
+
+{config['user']['name']} is {config['user']['role']}. This section must be TACTICAL and FINANCIAL — things that affect decisions this week, numbers that moved, or blockers/risks to active workstreams. Apply these filters strictly:
+
+Active workstreams to watch (include updates on these):
+- Borrow financial performance: ANM, GP, AOI, loss rates, origination volume, 0DPD, monetization rate, reserve rate changes
+- Q2 Outlook (Q2OL): forecast submissions, variance vs AP, any number changes
+- Business Plan (BP): FDIC submission status (60-day clock started 4/2), FDIC feedback, leverage ratio targets, dividend plan
+- Limits framework reset: new EWI metrics (4-week delinquency, trailing 3-month charge-off), D/E grade cap at 17%, board/management presentation status
+- CECL / loss reserves: model updates from UCML/Meng Qi, Kroll validation, reserve rate movements
+- Portfolio growth: Borrow Warehouse ramp to $1B by July, APCAC scaling to 600K, credit mix (C/D/E grades)
+- Intersegment FTP: repricing backbook from 1% to 3.5% ($5.5M impact), Square Savings funding strategy
+- Staffing: Linda Zhang onboarding for Retro/APCAC, any gaps on critical roles
+
+People whose activity is directly relevant:
+{', '.join(config['coverage']['key_people'])}
+
+What does NOT belong in this section:
+- A document was modified but the content is routine/boilerplate
+- General company announcements not tied to the workstreams above
+- Slack chatter that mentions a keyword but has no actionable substance
+- Items better suited for Company Trajectory (big strategic bets, not tactical)
+
 Financial impact signals:
 {chr(10).join('- ' + c for c in config['ranking']['financial_impact'])}
 Personal relevance signals:
@@ -440,7 +462,7 @@ Produce the digest in this exact format (Slack mrkdwn). You MUST include BOTH se
 
 *🎯 Top 10: For Your Role*
 
-[10 items — the most important updates for {config['user']['name']}'s specific role, combining financial impact and personal relevance into one ranked list]
+[10 items — tactical, financial, and operational updates that directly affect {config['user']['name']}'s active workstreams. Every item must answer: "What specifically happened, and why does it matter for a decision or number I own?" If you cannot answer that, the item does not belong here. Rank by urgency and financial magnitude.]
 
 ---
 
