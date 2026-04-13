@@ -109,7 +109,11 @@ def fetch_airtable(config):
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
             resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
             records = resp.get("records", [])
-            return [dict(_table=table_name, **r.get("fields", {})) for r in records]
+            return [dict(
+                _table=table_name,
+                _url=f"https://airtable.com/{base_id}/{table.get('id', '')}/{r['id']}",
+                **r.get("fields", {})
+            ) for r in records]
         except Exception as e:
             log(f"  Warning: failed to read {table_name}: {e}")
             return []
@@ -154,6 +158,7 @@ def _slack_search_batch(token, workspace_id, queries, label="Slack"):
                     "user": m.get("username", "unknown"),
                     "text": text[:500],
                     "ts": m.get("ts", ""),
+                    "permalink": m.get("permalink", ""),
                     "query": query
                 })
             return results
@@ -240,12 +245,23 @@ def _drive_search_batch(access_token, terms, label="Drive"):
                 name = f.get("name", "")
                 if any(skip in name.lower() for skip in ["1:1", "1-1", "meeting notes template", "calendar"]):
                     continue
+                doc_id = f.get("id", "")
+                mime = f.get("mimeType", "")
+                if "spreadsheet" in mime:
+                    url = f"https://docs.google.com/spreadsheets/d/{doc_id}"
+                elif "presentation" in mime:
+                    url = f"https://docs.google.com/presentation/d/{doc_id}"
+                elif "document" in mime:
+                    url = f"https://docs.google.com/document/d/{doc_id}"
+                else:
+                    url = f"https://drive.google.com/file/d/{doc_id}"
                 docs.append({
                     "name": name,
                     "author": f.get("lastModifyingUser", {}).get("displayName", "unknown"),
                     "modified": f.get("modifiedTime", ""),
-                    "mime": f.get("mimeType", ""),
-                    "id": f.get("id", ""),
+                    "mime": mime,
+                    "id": doc_id,
+                    "url": url,
                     "search_term": term
                 })
             return docs
@@ -311,10 +327,10 @@ Mode: {mode}
 ## Key people (items involving these people are personally relevant)
 {', '.join(config['coverage']['key_people'])}
 
-## Ranking criteria — Financial Impact
+## Ranking criteria — For Your Role (combines financial impact + personal relevance)
+Financial impact signals:
 {chr(10).join('- ' + c for c in config['ranking']['financial_impact'])}
-
-## Ranking criteria — Personal Relevance
+Personal relevance signals:
 {chr(10).join('- ' + c for c in config['ranking']['personal_relevance'])}
 
 ## Ranking criteria — Company Trajectory (big bets, company-changing initiatives)
@@ -323,53 +339,54 @@ Mode: {mode}
 {"## Previous snapshot (for delta comparison)" + chr(10) + prev_snapshot if mode == "DELTA" else ""}
 
 ## RAW DATA — Airtable ({len(airtable_data.get('records', []))} records)
+Each record includes a _url field with a direct link to the Airtable record.
 {json.dumps(airtable_data, indent=1, default=str)[:15000]}
 
 ## RAW DATA — Slack ({len(slack_data)} messages from user's coverage area)
+Each message includes a permalink field with a direct link to the Slack message.
 {json.dumps(slack_data, indent=1, default=str)[:12000]}
 
 ## RAW DATA — Slack Company Bets ({len(bets_slack_data)} messages from company-wide searches)
+Each message includes a permalink field with a direct link to the Slack message.
 {json.dumps(bets_slack_data, indent=1, default=str)[:10000]}
 
 ## RAW DATA — Google Drive ({len(drive_data.get('docs', []))} docs from user's coverage area)
+Each doc includes a url field with a direct link to the Google Drive document.
 {json.dumps(drive_data, indent=1, default=str)[:6000]}
 
 ## RAW DATA — Google Drive Company Bets ({len(bets_drive_data.get('docs', []))} docs from company-wide searches)
+Each doc includes a url field with a direct link to the Google Drive document.
 {json.dumps(bets_drive_data, indent=1, default=str)[:5000]}
 
 ## Instructions
 
-Produce the digest in this exact format (Slack mrkdwn). You MUST include ALL THREE sections.
+Produce the digest in this exact format (Slack mrkdwn). You MUST include BOTH sections.
 
 *📊 Daily Digest — {today}* _(run {run_count + 1} · {mode.lower()})_
 
-*🔴 Top 10: Financial Impact*
+*🎯 Top 10: For Your Role*
 
-[up to 10 items]
-
----
-
-*🎯 Top 10: On Your Radar*
-
-[up to 10 items]
+[10 items — the most important updates for {config['user']['name']}'s specific role, combining financial impact and personal relevance into one ranked list]
 
 ---
 
-*🚀 Top 5: Company Trajectory*
+*🚀 Top 10: Company Trajectory*
 
-[MANDATORY — up to 5 items. Trajectory-changing initiatives and big bets across the ENTIRE company, NOT limited to the user's coverage area. Use your judgment broadly. The configured search terms are just starting points — surface anything from ANY of the raw data that could meaningfully change Block's trajectory over the next 1-3 years. Examples: international expansion (Cash App Lite), new financial products (credit score, banking), major sales motion shifts (field sales, enterprise GTM), AI/ML bets that change how the company operates or competes, bitcoin/crypto strategic moves, strategic partnerships or acquisitions, major org restructuring or senior leadership changes, competitive threats that force a response, new regulatory regimes, large customer segment expansions. Cast a wide net — if it could move the stock price or fundamentally alter Block's competitive position, it belongs here.]
+[MANDATORY — 10 items. Trajectory-changing initiatives and big bets across the ENTIRE company, NOT limited to the user's coverage area. Use your judgment broadly. The configured search terms are just starting points — surface anything from ANY of the raw data that could meaningfully change Block's trajectory over the next 1-3 years. Examples: international expansion (Cash App Lite), new financial products (credit score, banking), major sales motion shifts (field sales, enterprise GTM), AI/ML bets that change how the company operates or competes, bitcoin/crypto strategic moves, strategic partnerships or acquisitions, major org restructuring or senior leadership changes, competitive threats that force a response, new regulatory regimes, large customer segment expansions. Cast a wide net — if it could move the stock price or fundamentally alter Block's competitive position, it belongs here.]
 
 ---
 _Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if not drive_data.get('error') else '❌'} · Sent by Claude_
 
 Rules:
-- Each item format: [N]. 🔴/🟡/🟢 *[Item name]* _(Airtable/Slack/Drive)_  then 2-3 sentences
+- Each item format: [N]. 🔴/🟡/🟢 *<Item name>* (<source link>)  then 2-3 sentences with the update.
 - 🔴 = action today, 🟡 = monitor, 🟢 = positive signal
+- LINKS: Every item MUST include exactly one clickable link to the most relevant source. Use the permalink (Slack), url (Drive), or _url (Airtable) from the raw data. Format as a Slack mrkdwn link: <https://...|Slack> or <https://...|Doc> or <https://...|Airtable>. If an item synthesizes multiple sources, link to the single most informative one.
+- SPECIFICITY ON CHANGES: Never say "has been updated" or "has changed." Say WHAT specifically changed. Bad: "The roadmap has been updated." Good: "Roadmap moved LTL launch from Q2 to Q3, citing FDIC review delays." Bad: "Loss forecasts were revised." Good: "Loss forecast revised up 20bps to 3.4% on weaker Q1 vintage performance."
 - Lead with "so what" and financial impact, not metadata
-- No duplicates across ANY of the three sections
-- Company Trajectory items should be DIFFERENT from Financial Impact and On Your Radar — broader, more strategic, company-wide. They can come from ANY raw data source, not just the company bets searches.
-- ALL THREE SECTIONS ARE MANDATORY. Do not skip Company Trajectory even if data is sparse — use your best judgment from whatever signals are available.
-- If {mode} is DELTA, only include genuine changes vs the previous snapshot
+- No duplicates across the two sections
+- Company Trajectory items should be DIFFERENT from For Your Role — broader, more strategic, company-wide
+- BOTH SECTIONS ARE MANDATORY
+- If {mode} is DELTA, only include genuine changes vs the previous snapshot — and state exactly what changed
 - Output ONLY the formatted digest, nothing else
 """
 
