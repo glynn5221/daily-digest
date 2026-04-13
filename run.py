@@ -400,11 +400,8 @@ Mode: {mode}
 ## Key people (items involving these people are personally relevant)
 {', '.join(config['coverage']['key_people'])}
 
-## What matters for "For Your Role" — ONLY include items that match these criteria
-
-{config['user']['name']} is {config['user']['role']}. This section must be TACTICAL and FINANCIAL — things that affect decisions this week, numbers that moved, or blockers/risks to active workstreams. Apply these filters strictly:
-
-Active workstreams to watch (include updates on these):
+## Context for ranking — {config['user']['name']}'s active workstreams
+{config['user']['name']} is {config['user']['role']}. Active workstreams:
 - Borrow financial performance: ANM, GP, AOI, loss rates, origination volume, 0DPD, monetization rate, reserve rate changes
 - Q2 Outlook (Q2OL): forecast submissions, variance vs AP, any number changes
 - Business Plan (BP): FDIC submission status (60-day clock started 4/2), FDIC feedback, leverage ratio targets, dividend plan
@@ -414,21 +411,12 @@ Active workstreams to watch (include updates on these):
 - Intersegment FTP: repricing backbook from 1% to 3.5% ($5.5M impact), Square Savings funding strategy
 - Staffing: Linda Zhang onboarding for Retro/APCAC, any gaps on critical roles
 
-People whose activity is directly relevant:
-{', '.join(config['coverage']['key_people'])}
-
-What does NOT belong in this section:
-- A document was modified but the content is routine/boilerplate
-- General company announcements not tied to the workstreams above
-- Slack chatter that mentions a keyword but has no actionable substance
-- Items better suited for Company Trajectory (big strategic bets, not tactical)
-
-Financial impact signals:
+## Ranking signals
+Financial impact:
 {chr(10).join('- ' + c for c in config['ranking']['financial_impact'])}
-Personal relevance signals:
+Personal relevance:
 {chr(10).join('- ' + c for c in config['ranking']['personal_relevance'])}
-
-## Ranking criteria — Company Trajectory (big bets, company-changing initiatives)
+Company trajectory:
 {chr(10).join('- ' + c for c in config.get('company_bets', {}).get('criteria', []))}
 
 {"## Previous snapshot (for delta comparison)" + chr(10) + prev_snapshot if mode == "DELTA" else ""}
@@ -456,19 +444,15 @@ IMPORTANT:
 
 ## Instructions
 
-Produce the digest in this exact format (Slack mrkdwn). You MUST include BOTH sections.
+Produce the digest in this exact format (Slack mrkdwn).
 
 *📊 Daily Digest — {today}* _(run {run_count + 1} · {mode.lower()})_
 
-*🎯 Top 10: For Your Role*
+*🚀 Block Company Trajectory — Top 20*
 
-[10 items — tactical, financial, and operational updates that directly affect {config['user']['name']}'s active workstreams. Every item must answer: "What specifically happened, and why does it matter for a decision or number I own?" If you cannot answer that, the item does not belong here. Rank by urgency and financial magnitude.]
+[20 items. This is a single unified list covering EVERYTHING worth knowing across Block today — from tactical updates on {config['user']['name']}'s own workstreams (Borrow metrics, Q2OL, BP/FDIC, limits reset, CECL, portfolio growth, FTP) to company-wide strategic bets (Cash App Lite international expansion, credit score, field sales growth, AI shifts, bitcoin/crypto moves, major org changes, competitive threats, new regulatory regimes, large customer segment expansions).
 
----
-
-*🚀 Top 10: Company Trajectory*
-
-[MANDATORY — 10 items. Trajectory-changing initiatives and big bets across the ENTIRE company, NOT limited to the user's coverage area. Use your judgment broadly. The configured search terms are just starting points — surface anything from ANY of the raw data that could meaningfully change Block's trajectory over the next 1-3 years. Examples: international expansion (Cash App Lite), new financial products (credit score, banking), major sales motion shifts (field sales, enterprise GTM), AI/ML bets that change how the company operates or competes, bitcoin/crypto strategic moves, strategic partnerships or acquisitions, major org restructuring or senior leadership changes, competitive threats that force a response, new regulatory regimes, large customer segment expansions. Cast a wide net — if it could move the stock price or fundamentally alter Block's competitive position, it belongs here.]
+Rank by impact magnitude. Items 1-5 should be the highest-stakes items regardless of whether they're tactical or strategic. The rest follow in descending order. Mix freely — do not segregate by type. A Borrow loss rate move and a Cash App Lite launch update can sit side by side if both are high-impact.]
 
 ---
 _Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if not drive_data.get('error') else '❌'} · Sent by Claude_
@@ -479,9 +463,8 @@ Rules:
 - LINKS: Every item MUST include exactly one clickable link. Copy the EXACT URL from the LINK field of the raw data item you are referencing. Do NOT modify, guess, or fabricate URLs. Format as Slack mrkdwn: <URL|Slack>, <URL|Doc>, or <URL|Airtable>. If an item synthesizes multiple sources, use the link from the single most informative source item.
 - SPECIFICITY ON CHANGES: Never say "has been updated" or "has changed." Say WHAT specifically changed. Bad: "The roadmap has been updated." Good: "Roadmap moved LTL launch from Q2 to Q3, citing FDIC review delays." Bad: "Loss forecasts were revised." Good: "Loss forecast revised up 20bps to 3.4% on weaker Q1 vintage performance."
 - Lead with "so what" and financial impact, not metadata
-- No duplicates across the two sections
-- Company Trajectory items should be DIFFERENT from For Your Role — broader, more strategic, company-wide
-- BOTH SECTIONS ARE MANDATORY
+- No duplicates
+- Do NOT include items just because a document was recently modified — only if the content reveals a substantive, actionable update
 - If {mode} is DELTA, only include genuine changes vs the previous snapshot — and state exactly what changed
 - Output ONLY the formatted digest, nothing else
 """
