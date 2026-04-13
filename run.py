@@ -645,32 +645,43 @@ Run number: {run_count + 1}
 Mode: {mode}
 
 ## Company context
-{config['user']['company']} is a financial technology company with major business units: Cash App (consumer), Square (seller), Afterpay (BNPL), TIDAL (music), and Bitkey (bitcoin). The reader is a senior finance leader who wants a board-level view of where the company is headed — not day-to-day operational updates.
+{config['user']['company']} is a financial technology company. Business units: Cash App (consumer), Square (seller), Afterpay (BNPL), TIDAL (music), Bitkey (bitcoin).
 
 ## Vocabulary (use these terms when relevant)
 {', '.join(config['coverage']['vocabulary'])}
 
-## What belongs in this digest
-This digest is about where Block is going as a company. Think like a senior executive or board member scanning for the 20 most important signals about Block's future. The question for every item is: "Does this affect Block's competitive position, growth trajectory, or strategic direction over the next 1-3 years?"
+## CRITICAL: What this digest IS and IS NOT
 
-Examples of what belongs:
-- Cash App Lite international expansion progress, market launches, regulatory clearances
-- New financial products: credit score, banking, savings, lending expansion
-- Square field sales growth, enterprise GTM, new seller segments
-- AI/ML bets that change how Block operates or competes — internal copilots, automation, model deployments
-- Bitcoin/crypto strategic moves — custody, payments, protocol development
-- Afterpay integration milestones, BNPL market position changes
-- Revenue diversification: lending concentration vs non-lending growth
-- Major org restructuring, senior leadership changes, key hires/departures
-- Regulatory shifts: FDIC actions, new compliance regimes, state-level changes
-- Competitive threats that force a response (PayPal, Apple, Stripe, banks)
-- Capital allocation: dividends, buybacks, M&A, balance sheet strategy
-- Macro signals that directly affect Block's business model
+This digest covers Block's COMPANY-WIDE strategic bets and trajectory — the big moves that will define where Block goes over the next 1-3 years. The reader already gets separate daily coverage of Borrow, SFS, APCAC, Retro, and lending. DO NOT INCLUDE ANY OF THOSE TOPICS.
 
-Examples of what does NOT belong:
-- Routine operational updates (a team standup, a doc reformatted, a minor config change)
-- Tactical items that only matter to one person's day-to-day workflow
-- Items where the only signal is "a document was modified" with no substantive content
+EXPLICITLY EXCLUDED (the reader already has these covered):
+- Borrow, SFS, Square Financial Services, APCAC, Retro, lending, consumer loans
+- CECL, ANM, RAROC, RAS, EWI, loss rates, charge-off, delinquency
+- FDIC submissions, bank regulatory items specific to SFS
+- Anything about the Borrow product, lending portfolio, or loan performance
+
+WHAT BELONGS — Block's future beyond lending:
+- Neighborhoods / local commerce discovery
+- Autonomy / self-driving / fleet / delivery
+- Managerbot, Moneybot, AI agents that change how Block operates
+- Bitcoin: mining, custody, lightning, protocol, bitkey hardware wallet
+- Cash App Lite / international expansion — new countries, regulatory clearances
+- Cash App credit score, banking, savings (NOT lending)
+- Square GTM: field sales, enterprise, new seller verticals, GPV growth
+- Square org changes, platform evolution, competitive positioning
+- Afterpay/Clearpay integration, BNPL growth, international
+- TIDAL music strategy
+- Big wins, milestones, record metrics across any BU
+- Senior leadership moves, major reorgs, cultural shifts (Jack's directives)
+- Competitive threats: PayPal, Apple, Stripe, banks, neobanks
+- M&A, partnerships, strategic deals
+- Earnings, guidance, analyst sentiment, investor narrative
+- Macro shifts that affect Block's model
+
+DOES NOT BELONG:
+- Routine operational updates, team standups, sprint progress
+- A doc was modified with no substantive strategic content
+- ANY Borrow/SFS/APCAC/Retro/lending content (this is the most important rule)
 
 {"## Previous snapshot (for delta comparison)" + chr(10) + prev_snapshot if mode == "DELTA" else ""}
 
