@@ -361,6 +361,14 @@ def _format_slack_for_prompt(messages, max_chars=12000):
     return "\n".join(lines) if lines else "(no messages)"
 
 
+def _merge_drive(d1, d2):
+    """Merge two drive result dicts, deduplicating by doc ID."""
+    all_docs = d1.get("docs", []) + d2.get("docs", [])
+    seen = set()
+    unique = [d for d in all_docs if d["id"] not in seen and not seen.add(d["id"])]
+    return {"docs": unique}
+
+
 def _format_drive_for_prompt(drive_data, max_chars=20000):
     lines = []
     total = 0
@@ -391,33 +399,33 @@ Today's date: {today}
 Run number: {run_count + 1}
 Mode: {mode}
 
-## User's coverage area
-{config['coverage']['description']}
+## Company context
+{config['user']['company']} is a financial technology company with major business units: Cash App (consumer), Square (seller), Afterpay (BNPL), TIDAL (music), and Bitkey (bitcoin). The reader is a senior finance leader who wants a board-level view of where the company is headed — not day-to-day operational updates.
 
-## User's vocabulary (use these terms)
+## Vocabulary (use these terms when relevant)
 {', '.join(config['coverage']['vocabulary'])}
 
-## Key people (items involving these people are personally relevant)
-{', '.join(config['coverage']['key_people'])}
+## What belongs in this digest
+This digest is about where Block is going as a company. Think like a senior executive or board member scanning for the 20 most important signals about Block's future. The question for every item is: "Does this affect Block's competitive position, growth trajectory, or strategic direction over the next 1-3 years?"
 
-## Context for ranking — {config['user']['name']}'s active workstreams
-{config['user']['name']} is {config['user']['role']}. Active workstreams:
-- Borrow financial performance: ANM, GP, AOI, loss rates, origination volume, 0DPD, monetization rate, reserve rate changes
-- Q2 Outlook (Q2OL): forecast submissions, variance vs AP, any number changes
-- Business Plan (BP): FDIC submission status (60-day clock started 4/2), FDIC feedback, leverage ratio targets, dividend plan
-- Limits framework reset: new EWI metrics (4-week delinquency, trailing 3-month charge-off), D/E grade cap at 17%, board/management presentation status
-- CECL / loss reserves: model updates from UCML/Meng Qi, Kroll validation, reserve rate movements
-- Portfolio growth: Borrow Warehouse ramp to $1B by July, APCAC scaling to 600K, credit mix (C/D/E grades)
-- Intersegment FTP: repricing backbook from 1% to 3.5% ($5.5M impact), Square Savings funding strategy
-- Staffing: Linda Zhang onboarding for Retro/APCAC, any gaps on critical roles
+Examples of what belongs:
+- Cash App Lite international expansion progress, market launches, regulatory clearances
+- New financial products: credit score, banking, savings, lending expansion
+- Square field sales growth, enterprise GTM, new seller segments
+- AI/ML bets that change how Block operates or competes — internal copilots, automation, model deployments
+- Bitcoin/crypto strategic moves — custody, payments, protocol development
+- Afterpay integration milestones, BNPL market position changes
+- Revenue diversification: lending concentration vs non-lending growth
+- Major org restructuring, senior leadership changes, key hires/departures
+- Regulatory shifts: FDIC actions, new compliance regimes, state-level changes
+- Competitive threats that force a response (PayPal, Apple, Stripe, banks)
+- Capital allocation: dividends, buybacks, M&A, balance sheet strategy
+- Macro signals that directly affect Block's business model
 
-## Ranking signals
-Financial impact:
-{chr(10).join('- ' + c for c in config['ranking']['financial_impact'])}
-Personal relevance:
-{chr(10).join('- ' + c for c in config['ranking']['personal_relevance'])}
-Company trajectory:
-{chr(10).join('- ' + c for c in config.get('company_bets', {}).get('criteria', []))}
+Examples of what does NOT belong:
+- Routine operational updates (a team standup, a doc reformatted, a minor config change)
+- Tactical items that only matter to one person's day-to-day workflow
+- Items where the only signal is "a document was modified" with no substantive content
 
 {"## Previous snapshot (for delta comparison)" + chr(10) + prev_snapshot if mode == "DELTA" else ""}
 
@@ -427,20 +435,14 @@ IMPORTANT:
 1. Each raw data item below has a LINK field. When you reference an item in the digest, you MUST use that item's exact LINK value — do NOT swap links between items or fabricate URLs.
 2. Google Drive docs include their actual CONTENT. Read the content to determine what the document is about and what specifically was updated. Do NOT include a Drive doc in the digest just because it was recently modified — only include it if the content is substantively relevant. A doc titled "Q2 Forecast" that contains boilerplate or irrelevant content should be skipped.
 
-### Airtable ({len(airtable_data.get('records', []))} records)
+### Airtable Roadmap ({len(airtable_data.get('records', []))} records)
 {_format_airtable_for_prompt(airtable_data)}
 
-### Slack — Coverage Area ({len(slack_data)} messages)
-{_format_slack_for_prompt(slack_data)}
+### Slack ({len(slack_data) + len(bets_slack_data)} messages across Block)
+{_format_slack_for_prompt(slack_data + bets_slack_data)}
 
-### Slack — Company Bets ({len(bets_slack_data)} messages)
-{_format_slack_for_prompt(bets_slack_data)}
-
-### Google Drive — Coverage Area ({len(drive_data.get('docs', []))} docs)
-{_format_drive_for_prompt(drive_data)}
-
-### Google Drive — Company Bets ({len(bets_drive_data.get('docs', []))} docs)
-{_format_drive_for_prompt(bets_drive_data)}
+### Google Drive ({len(drive_data.get('docs', [])) + len(bets_drive_data.get('docs', []))} docs across Block)
+{_format_drive_for_prompt(_merge_drive(drive_data, bets_drive_data))}
 
 ## Instructions
 
@@ -450,9 +452,9 @@ Produce the digest in this exact format (Slack mrkdwn).
 
 *🚀 Block Company Trajectory — Top 20*
 
-[20 items. This is a single unified list covering EVERYTHING worth knowing across Block today — from tactical updates on {config['user']['name']}'s own workstreams (Borrow metrics, Q2OL, BP/FDIC, limits reset, CECL, portfolio growth, FTP) to company-wide strategic bets (Cash App Lite international expansion, credit score, field sales growth, AI shifts, bitcoin/crypto moves, major org changes, competitive threats, new regulatory regimes, large customer segment expansions).
+[20 items. Each item should represent a signal about where Block is headed as a company. Think like a senior executive or board member: what are the 20 most important things happening across Block right now that affect the company's future competitive position, growth, and strategic direction?
 
-Rank by impact magnitude. Items 1-5 should be the highest-stakes items regardless of whether they're tactical or strategic. The rest follow in descending order. Mix freely — do not segregate by type. A Borrow loss rate move and a Cash App Lite launch update can sit side by side if both are high-impact.]
+Rank by how much the item could move the needle for Block over the next 1-3 years. Items 1-5 should be the highest-magnitude signals. Cast a wide net across ALL of Block — Cash App, Square, Afterpay, TIDAL, Bitkey, corporate. Do NOT over-index on any single team or function.]
 
 ---
 _Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if not drive_data.get('error') else '❌'} · Sent by Claude_
@@ -462,9 +464,10 @@ Rules:
 - 🔴 = action today, 🟡 = monitor, 🟢 = positive signal
 - LINKS: Every item MUST include exactly one clickable link. Copy the EXACT URL from the LINK field of the raw data item you are referencing. Do NOT modify, guess, or fabricate URLs. Format as Slack mrkdwn: <URL|Slack>, <URL|Doc>, or <URL|Airtable>. If an item synthesizes multiple sources, use the link from the single most informative source item.
 - SPECIFICITY ON CHANGES: Never say "has been updated" or "has changed." Say WHAT specifically changed. Bad: "The roadmap has been updated." Good: "Roadmap moved LTL launch from Q2 to Q3, citing FDIC review delays." Bad: "Loss forecasts were revised." Good: "Loss forecast revised up 20bps to 3.4% on weaker Q1 vintage performance."
-- Lead with "so what" and financial impact, not metadata
+- Lead with "so what" and strategic impact, not metadata
 - No duplicates
-- Do NOT include items just because a document was recently modified — only if the content reveals a substantive, actionable update
+- Do NOT include items just because a document was recently modified — only if the content reveals a substantive strategic signal
+- STRATEGIC, NOT OPERATIONAL: Do not include granular operational updates (sprint progress, team standups, minor metric moves, routine process updates). Every item should pass the test: "Would a board member or senior executive care about this?" If the answer is no, skip it.
 - If {mode} is DELTA, only include genuine changes vs the previous snapshot — and state exactly what changed
 - Output ONLY the formatted digest, nothing else
 """
