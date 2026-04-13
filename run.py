@@ -9,6 +9,7 @@ No Claude Code permissions needed. Runs via cron.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -312,6 +313,250 @@ def _drive_search_batch(access_token, terms, label="Drive"):
     return {"docs": unique}
 
 
+# ── Gemini Meeting Notes ──────────────────────────────────────────────────
+
+def fetch_gemini_notes(access_token, config):
+    """Fetch Gemini auto-generated meeting notes from the last 24h."""
+    if not access_token:
+        return {"docs": []}
+
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+    queries = [
+        f"modifiedTime>'{yesterday}' and name contains 'Meeting notes'",
+        f"modifiedTime>'{yesterday}' and name contains 'Gemini'",
+        f"modifiedTime>'{yesterday}' and name contains 'meeting summary'",
+    ]
+
+    def _search_one(q):
+        params = urllib.parse.urlencode({
+            "q": q,
+            "fields": "files(id,name,modifiedTime,lastModifyingUser/displayName,mimeType)",
+            "orderBy": "modifiedTime desc",
+            "pageSize": "20"
+        })
+        url = f"https://www.googleapis.com/drive/v3/files?{params}"
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+            resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            docs = []
+            for f in resp.get("files", []):
+                doc_id = f.get("id", "")
+                mime = f.get("mimeType", "")
+                if "document" in mime:
+                    doc_url = f"https://docs.google.com/document/d/{doc_id}"
+                else:
+                    continue  # meeting notes are always docs
+                docs.append({
+                    "name": f.get("name", ""),
+                    "author": f.get("lastModifyingUser", {}).get("displayName", "unknown"),
+                    "modified": f.get("modifiedTime", ""),
+                    "mime": mime,
+                    "id": doc_id,
+                    "url": doc_url,
+                    "search_term": "gemini_meeting_notes"
+                })
+            return docs
+        except Exception:
+            return []
+
+    all_docs = []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(_search_one, q) for q in queries]
+        for future in as_completed(futures):
+            all_docs.extend(future.result())
+
+    seen = set()
+    unique = [d for d in all_docs if d["id"] not in seen and not seen.add(d["id"])]
+
+    # Read content in parallel
+    def _read(doc):
+        doc["content"] = _drive_read_content(access_token, doc)
+        return doc
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        unique = list(pool.map(_read, unique))
+
+    with_content = sum(1 for d in unique if d.get("content"))
+    log(f"  Gemini: {len(unique)} meeting notes ({with_content} with content)")
+    return {"docs": unique}
+
+
+# ── Multi-hop Reference Following ────────────────────────────────────────
+
+_DOC_URL_RE = re.compile(
+    r'https://docs\.google\.com/(?:document|spreadsheets|presentation)/d/([a-zA-Z0-9_-]+)'
+)
+_DRIVE_URL_RE = re.compile(
+    r'https://drive\.google\.com/(?:file/d|open\?id=)([a-zA-Z0-9_-]+)'
+)
+
+
+def _extract_doc_ids(texts):
+    """Extract unique Google Doc/Sheet/Slide IDs from a list of text strings."""
+    ids = set()
+    for text in texts:
+        ids.update(_DOC_URL_RE.findall(text))
+        ids.update(_DRIVE_URL_RE.findall(text))
+    return ids
+
+
+def follow_references(access_token, slack_messages, drive_docs, existing_doc_ids):
+    """Follow Google Doc URLs found in Slack messages and Drive docs (1 hop)."""
+    if not access_token:
+        return {"docs": []}
+
+    # Collect all text that might contain URLs
+    texts = [m.get("text", "") for m in slack_messages]
+    texts += [d.get("content", "") for d in drive_docs if d.get("content")]
+
+    # Extract doc IDs and remove ones we already have
+    found_ids = _extract_doc_ids(texts)
+    new_ids = found_ids - existing_doc_ids
+
+    if not new_ids:
+        log("  Refs: no new document references found")
+        return {"docs": []}
+
+    log(f"  Refs: following {len(new_ids)} new document references...")
+
+    def _fetch_one(doc_id):
+        try:
+            # Get metadata
+            params = urllib.parse.urlencode({
+                "fields": "id,name,modifiedTime,lastModifyingUser/displayName,mimeType"
+            })
+            url = f"https://www.googleapis.com/drive/v3/files/{doc_id}?{params}"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+            meta = json.loads(urllib.request.urlopen(req, timeout=15).read())
+
+            mime = meta.get("mimeType", "")
+            name = meta.get("name", "")
+
+            if "spreadsheet" in mime:
+                doc_url = f"https://docs.google.com/spreadsheets/d/{doc_id}"
+            elif "presentation" in mime:
+                doc_url = f"https://docs.google.com/presentation/d/{doc_id}"
+            elif "document" in mime:
+                doc_url = f"https://docs.google.com/document/d/{doc_id}"
+            else:
+                return None  # skip binary/unknown
+
+            doc = {
+                "name": name,
+                "author": meta.get("lastModifyingUser", {}).get("displayName", "unknown"),
+                "modified": meta.get("modifiedTime", ""),
+                "mime": mime,
+                "id": doc_id,
+                "url": doc_url,
+                "search_term": "reference_follow"
+            }
+            doc["content"] = _drive_read_content(access_token, doc)
+            return doc
+        except Exception:
+            return None
+
+    docs = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_fetch_one, did) for did in list(new_ids)[:30]]  # cap at 30
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                docs.append(result)
+
+    with_content = sum(1 for d in docs if d.get("content"))
+    log(f"  Refs: {len(docs)} linked docs fetched ({with_content} with content)")
+    return {"docs": docs}
+
+
+# ── Person-based Search Expansion ────────────────────────────────────────
+
+def fetch_people_slack(config):
+    """Search Slack for recent messages FROM key people (not just about keywords)."""
+    people = config["coverage"].get("key_people_identifiers", [])
+    if not people:
+        return []
+
+    token = config["credentials"]["slack_token"]
+    workspace_id = config["sources"]["slack"].get("workspace_id", "")
+    queries = [f"from:@{p['slack']}" for p in people if p.get("slack")]
+
+    return _slack_search_batch(token, workspace_id, queries, "People-Slack")
+
+
+def fetch_people_drive(access_token, config):
+    """Search Drive for docs recently modified by key people."""
+    people = config["coverage"].get("key_people_identifiers", [])
+    if not people or not access_token:
+        return {"docs": []}
+
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+
+    def _search_person(person):
+        email = person.get("email", "")
+        if not email:
+            return []
+        # Search for docs this person has edited recently
+        query = f"modifiedTime>'{yesterday}' and '{email}' in writers"
+        params = urllib.parse.urlencode({
+            "q": query,
+            "fields": "files(id,name,modifiedTime,lastModifyingUser/displayName,mimeType)",
+            "orderBy": "modifiedTime desc",
+            "pageSize": "5"
+        })
+        url = f"https://www.googleapis.com/drive/v3/files?{params}"
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+            resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            docs = []
+            for f in resp.get("files", []):
+                name = f.get("name", "")
+                if any(skip in name.lower() for skip in ["1:1", "1-1", "meeting notes template", "calendar"]):
+                    continue
+                doc_id = f.get("id", "")
+                mime = f.get("mimeType", "")
+                if "spreadsheet" in mime:
+                    doc_url = f"https://docs.google.com/spreadsheets/d/{doc_id}"
+                elif "presentation" in mime:
+                    doc_url = f"https://docs.google.com/presentation/d/{doc_id}"
+                elif "document" in mime:
+                    doc_url = f"https://docs.google.com/document/d/{doc_id}"
+                else:
+                    doc_url = f"https://drive.google.com/file/d/{doc_id}"
+                docs.append({
+                    "name": name,
+                    "author": f.get("lastModifyingUser", {}).get("displayName", person["name"]),
+                    "modified": f.get("modifiedTime", ""),
+                    "mime": mime,
+                    "id": doc_id,
+                    "url": doc_url,
+                    "search_term": f"person:{person['name']}"
+                })
+            return docs
+        except Exception:
+            return []
+
+    all_docs = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_search_person, p) for p in people]
+        for future in as_completed(futures):
+            all_docs.extend(future.result())
+
+    seen = set()
+    unique = [d for d in all_docs if d["id"] not in seen and not seen.add(d["id"])]
+
+    # Read content
+    def _read(doc):
+        doc["content"] = _drive_read_content(access_token, doc)
+        return doc
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        unique = list(pool.map(_read, unique))
+
+    with_content = sum(1 for d in unique if d.get("content"))
+    log(f"  People-Drive: {len(unique)} docs ({with_content} with content) from {len(people)} people")
+    return {"docs": unique}
+
+
 # ── Send Slack DM ─────────────────────────────────────────────────────────
 
 def send_slack_dm(config, message):
@@ -438,11 +683,11 @@ IMPORTANT:
 ### Airtable Roadmap ({len(airtable_data.get('records', []))} records)
 {_format_airtable_for_prompt(airtable_data)}
 
-### Slack ({len(slack_data) + len(bets_slack_data)} messages across Block)
-{_format_slack_for_prompt(slack_data + bets_slack_data)}
+### Slack ({len(slack_data)} messages — keyword searches, key people's messages, company-wide signals)
+{_format_slack_for_prompt(slack_data, max_chars=15000)}
 
-### Google Drive ({len(drive_data.get('docs', [])) + len(bets_drive_data.get('docs', []))} docs across Block)
-{_format_drive_for_prompt(_merge_drive(drive_data, bets_drive_data))}
+### Google Drive ({len(drive_data.get('docs', []))} docs — keyword searches, key people's edits, meeting notes, linked references)
+{_format_drive_for_prompt(drive_data, max_chars=25000)}
 
 ## Instructions
 
@@ -457,7 +702,7 @@ Produce the digest in this exact format (Slack mrkdwn).
 Rank by how much the item could move the needle for Block over the next 1-3 years. Items 1-5 should be the highest-magnitude signals. Cast a wide net across ALL of Block — Cash App, Square, Afterpay, TIDAL, Bitkey, corporate. Do NOT over-index on any single team or function.]
 
 ---
-_Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if not drive_data.get('error') else '❌'} · Sent by Claude_
+_Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if drive_data.get('docs') else '❌'} · Meeting Notes ✅ · Ref-Follow ✅ · People ✅ · Sent by Claude_
 
 Rules:
 - Each item format: [N]. 🔴/🟡/🟢 *<Item name>* (<source link>)  then 2-3 sentences with the update.
@@ -476,7 +721,7 @@ Rules:
     try:
         result = subprocess.run(
             ["claude", "-p", prompt, "--model", "sonnet"],
-            capture_output=True, text=True, timeout=300
+            capture_output=True, text=True, timeout=600
         )
         if result.returncode != 0:
             log(f"  claude -p failed: {result.stderr[:500]}")
@@ -487,7 +732,7 @@ Rules:
             try:
                 result = subprocess.run(
                     [path, "-p", prompt, "--model", "sonnet"],
-                    capture_output=True, text=True, timeout=300
+                    capture_output=True, text=True, timeout=600
                 )
                 if result.returncode == 0:
                     return result.stdout.strip()
@@ -512,37 +757,75 @@ def main():
     run_count = state.get("run_count", 0)
     log(f"Run #{run_count + 1} | Mode: {'BASELINE' if run_count < 3 else 'DELTA'}")
 
-    # Get Drive OAuth token once (shared across both Drive fetches)
+    # Get Drive OAuth token once (shared across ALL Drive fetches)
     log("Refreshing Drive OAuth token...")
     drive_token = _get_drive_access_token(config)
 
-    # Fetch ALL data sources in parallel
-    log("Fetching all sources in parallel...")
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    # ── Phase 1: Fetch all primary sources + new sources in parallel ──
+    log("Phase 1: Fetching all sources in parallel...")
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        # Existing sources
         f_airtable = pool.submit(fetch_airtable, config)
         f_slack = pool.submit(fetch_slack, config)
         f_bets_slack = pool.submit(fetch_slack_company_bets, config)
-
         drive_terms = config["coverage"]["drive_search_terms"]
         bets_drive_terms = config.get("company_bets", {}).get("drive_search_terms", [])
         f_drive = pool.submit(_drive_search_batch, drive_token, drive_terms, "Drive")
         f_bets_drive = pool.submit(_drive_search_batch, drive_token, bets_drive_terms, "Bets Drive")
+
+        # NEW: Gemini meeting notes
+        f_gemini = pool.submit(fetch_gemini_notes, drive_token, config)
+        # NEW: Person-based expansion
+        f_people_slack = pool.submit(fetch_people_slack, config)
+        f_people_drive = pool.submit(fetch_people_drive, drive_token, config)
 
         airtable_data = f_airtable.result()
         slack_data = f_slack.result()
         bets_slack_data = f_bets_slack.result()
         drive_data = f_drive.result()
         bets_drive_data = f_bets_drive.result()
+        gemini_data = f_gemini.result()
+        people_slack_data = f_people_slack.result()
+        people_drive_data = f_people_drive.result()
+
+    phase1_elapsed = (datetime.now() - start_time).total_seconds()
+    log(f"Phase 1 complete in {phase1_elapsed:.1f}s — "
+        f"AT:{len(airtable_data.get('records',[]))} "
+        f"SL:{len(slack_data)} BetsSL:{len(bets_slack_data)} PeopleSL:{len(people_slack_data)} "
+        f"DR:{len(drive_data.get('docs',[]))} BetsDR:{len(bets_drive_data.get('docs',[]))} "
+        f"Gemini:{len(gemini_data.get('docs',[]))} PeopleDR:{len(people_drive_data.get('docs',[]))}")
+
+    # ── Phase 2: Multi-hop reference following ──
+    # Extract URLs from all Slack messages and Drive doc content, follow them one hop
+    log("Phase 2: Following document references...")
+    all_slack = slack_data + bets_slack_data + people_slack_data
+    all_drive = _merge_drive(_merge_drive(drive_data, bets_drive_data),
+                             _merge_drive(gemini_data, people_drive_data))
+    existing_doc_ids = {d["id"] for d in all_drive.get("docs", [])}
+
+    refs_data = follow_references(drive_token, all_slack, all_drive.get("docs", []), existing_doc_ids)
+
+    phase2_elapsed = (datetime.now() - start_time).total_seconds()
+    log(f"Phase 2 complete in {phase2_elapsed:.1f}s — Refs:{len(refs_data.get('docs',[]))}")
+
+    # ── Merge all data ──
+    # Slack: merge all three streams
+    merged_slack = all_slack
+    # Deduplicate slack by timestamp
+    seen_ts = set()
+    merged_slack = [m for m in merged_slack if m["ts"] not in seen_ts and not seen_ts.add(m["ts"])]
+
+    # Drive: merge all five streams
+    merged_drive = _merge_drive(all_drive, refs_data)
 
     airtable_ok = "error" not in airtable_data
-    slack_ok = len(slack_data) > 0
-    drive_ok = "error" not in drive_data
+    slack_ok = len(merged_slack) > 0
+    drive_ok = len(merged_drive.get("docs", [])) > 0
 
-    fetch_elapsed = (datetime.now() - start_time).total_seconds()
-    log(f"All fetches complete in {fetch_elapsed:.1f}s — AT:{len(airtable_data.get('records',[]))} SL:{len(slack_data)} BetsSL:{len(bets_slack_data)} DR:{len(drive_data.get('docs',[]))} BetsDR:{len(bets_drive_data.get('docs',[]))}")
+    log(f"Merged totals — SL:{len(merged_slack)} DR:{len(merged_drive.get('docs',[]))}")
 
     # Synthesize with Claude
-    digest = synthesize(config, state, airtable_data, slack_data, drive_data, bets_slack_data, bets_drive_data)
+    digest = synthesize(config, state, airtable_data, merged_slack, merged_drive, [], {"docs": []})
 
     if not digest:
         log("ERROR: Synthesis failed — no digest produced")
@@ -571,8 +854,8 @@ def main():
         },
         "snapshot": {
             "airtable": airtable_data,
-            "slack_topics": list(set(m.get("query", "") for m in slack_data)),
-            "drive_docs": [{"name": d["name"], "author": d["author"]} for d in drive_data.get("docs", [])]
+            "slack_topics": list(set(m.get("query", "") for m in merged_slack)),
+            "drive_docs": [{"name": d["name"], "author": d["author"]} for d in merged_drive.get("docs", [])]
         }
     }
     save_state(new_state)
