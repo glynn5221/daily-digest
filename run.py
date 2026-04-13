@@ -221,8 +221,29 @@ def _get_drive_access_token(config):
         return None
 
 
+def _drive_read_content(access_token, doc):
+    """Export a Google Drive doc's text content (truncated)."""
+    doc_id = doc["id"]
+    mime = doc.get("mime", "")
+    try:
+        if "spreadsheet" in mime:
+            export_mime = "text/csv"
+        elif "presentation" in mime:
+            export_mime = "text/plain"
+        elif "document" in mime:
+            export_mime = "text/plain"
+        else:
+            return ""  # skip binary files
+        url = f"https://www.googleapis.com/drive/v3/files/{doc_id}/export?mimeType={urllib.parse.quote(export_mime)}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
+        content = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", errors="replace")
+        return content[:2000]  # first 2000 chars — enough to assess relevance
+    except Exception:
+        return ""
+
+
 def _drive_search_batch(access_token, terms, label="Drive"):
-    """Search Drive for multiple terms in parallel."""
+    """Search Drive for modified docs, then read their content in parallel."""
     if not access_token:
         return {"error": "No access token", "docs": []}
 
@@ -268,6 +289,7 @@ def _drive_search_batch(access_token, terms, label="Drive"):
         except Exception:
             return []
 
+    # Phase 1: search for modified docs
     all_docs = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = [pool.submit(_search_one, t) for t in terms]
@@ -276,7 +298,17 @@ def _drive_search_batch(access_token, terms, label="Drive"):
 
     seen = set()
     unique = [d for d in all_docs if d["id"] not in seen and not seen.add(d["id"])]
-    log(f"  {label}: {len(unique)} unique docs from {len(terms)} searches")
+
+    # Phase 2: read content of each doc in parallel
+    def _read_one(doc):
+        doc["content"] = _drive_read_content(access_token, doc)
+        return doc
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        unique = list(pool.map(_read_one, unique))
+
+    docs_with_content = sum(1 for d in unique if d.get("content"))
+    log(f"  {label}: {len(unique)} unique docs ({docs_with_content} with content) from {len(terms)} searches")
     return {"docs": unique}
 
 
@@ -285,7 +317,7 @@ def _drive_search_batch(access_token, terms, label="Drive"):
 def send_slack_dm(config, message):
     token = config["credentials"]["slack_token"]
     channel = config["user"]["slack_id"]
-    data = json.dumps({"channel": channel, "text": message, "mrkdwn": True}).encode()
+    data = json.dumps({"channel": channel, "text": message, "mrkdwn": True, "unfurl_links": False, "unfurl_media": False}).encode()
     req = urllib.request.Request(
         "https://slack.com/api/chat.postMessage",
         data=data,
@@ -302,6 +334,47 @@ def send_slack_dm(config, message):
     except Exception as e:
         log(f"  Slack DM error: {e}")
         return False
+
+
+# ── Prompt formatting helpers ─────────────────────────────────────────────
+
+def _format_airtable_for_prompt(airtable_data, max_chars=15000):
+    lines = []
+    for r in airtable_data.get("records", []):
+        name = r.get("Name", r.get("_table", "unnamed"))
+        url = r.get("_url", "")
+        fields = {k: v for k, v in r.items() if k not in ("_table", "_url")}
+        line = f"- {name} | LINK: {url} | {json.dumps(fields, default=str)}"
+        lines.append(line)
+        if sum(len(l) for l in lines) > max_chars:
+            break
+    return "\n".join(lines) if lines else "(no records)"
+
+
+def _format_slack_for_prompt(messages, max_chars=12000):
+    lines = []
+    for m in messages:
+        line = f"- #{m['channel']} @{m['user']}: {m['text'][:300]} | LINK: {m.get('permalink', 'none')}"
+        lines.append(line)
+        if sum(len(l) for l in lines) > max_chars:
+            break
+    return "\n".join(lines) if lines else "(no messages)"
+
+
+def _format_drive_for_prompt(drive_data, max_chars=20000):
+    lines = []
+    total = 0
+    for d in drive_data.get("docs", []):
+        content = d.get("content", "").strip()
+        if not content:
+            continue  # skip docs we couldn't read — no way to assess relevance
+        snippet = content[:1500].replace("\n", " ").strip()
+        line = f"- {d['name']} (by {d['author']}, modified {d['modified']}) | LINK: {d.get('url', 'none')}\n  CONTENT: {snippet}"
+        total += len(line)
+        if total > max_chars:
+            break
+        lines.append(line)
+    return "\n".join(lines) if lines else "(no docs with readable content)"
 
 
 # ── Claude synthesis ──────────────────────────────────────────────────────
@@ -338,25 +411,26 @@ Personal relevance signals:
 
 {"## Previous snapshot (for delta comparison)" + chr(10) + prev_snapshot if mode == "DELTA" else ""}
 
-## RAW DATA — Airtable ({len(airtable_data.get('records', []))} records)
-Each record includes a _url field with a direct link to the Airtable record.
-{json.dumps(airtable_data, indent=1, default=str)[:15000]}
+## RAW DATA
 
-## RAW DATA — Slack ({len(slack_data)} messages from user's coverage area)
-Each message includes a permalink field with a direct link to the Slack message.
-{json.dumps(slack_data, indent=1, default=str)[:12000]}
+IMPORTANT:
+1. Each raw data item below has a LINK field. When you reference an item in the digest, you MUST use that item's exact LINK value — do NOT swap links between items or fabricate URLs.
+2. Google Drive docs include their actual CONTENT. Read the content to determine what the document is about and what specifically was updated. Do NOT include a Drive doc in the digest just because it was recently modified — only include it if the content is substantively relevant. A doc titled "Q2 Forecast" that contains boilerplate or irrelevant content should be skipped.
 
-## RAW DATA — Slack Company Bets ({len(bets_slack_data)} messages from company-wide searches)
-Each message includes a permalink field with a direct link to the Slack message.
-{json.dumps(bets_slack_data, indent=1, default=str)[:10000]}
+### Airtable ({len(airtable_data.get('records', []))} records)
+{_format_airtable_for_prompt(airtable_data)}
 
-## RAW DATA — Google Drive ({len(drive_data.get('docs', []))} docs from user's coverage area)
-Each doc includes a url field with a direct link to the Google Drive document.
-{json.dumps(drive_data, indent=1, default=str)[:6000]}
+### Slack — Coverage Area ({len(slack_data)} messages)
+{_format_slack_for_prompt(slack_data)}
 
-## RAW DATA — Google Drive Company Bets ({len(bets_drive_data.get('docs', []))} docs from company-wide searches)
-Each doc includes a url field with a direct link to the Google Drive document.
-{json.dumps(bets_drive_data, indent=1, default=str)[:5000]}
+### Slack — Company Bets ({len(bets_slack_data)} messages)
+{_format_slack_for_prompt(bets_slack_data)}
+
+### Google Drive — Coverage Area ({len(drive_data.get('docs', []))} docs)
+{_format_drive_for_prompt(drive_data)}
+
+### Google Drive — Company Bets ({len(bets_drive_data.get('docs', []))} docs)
+{_format_drive_for_prompt(bets_drive_data)}
 
 ## Instructions
 
@@ -380,7 +454,7 @@ _Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack
 Rules:
 - Each item format: [N]. 🔴/🟡/🟢 *<Item name>* (<source link>)  then 2-3 sentences with the update.
 - 🔴 = action today, 🟡 = monitor, 🟢 = positive signal
-- LINKS: Every item MUST include exactly one clickable link to the most relevant source. Use the permalink (Slack), url (Drive), or _url (Airtable) from the raw data. Format as a Slack mrkdwn link: <https://...|Slack> or <https://...|Doc> or <https://...|Airtable>. If an item synthesizes multiple sources, link to the single most informative one.
+- LINKS: Every item MUST include exactly one clickable link. Copy the EXACT URL from the LINK field of the raw data item you are referencing. Do NOT modify, guess, or fabricate URLs. Format as Slack mrkdwn: <URL|Slack>, <URL|Doc>, or <URL|Airtable>. If an item synthesizes multiple sources, use the link from the single most informative source item.
 - SPECIFICITY ON CHANGES: Never say "has been updated" or "has changed." Say WHAT specifically changed. Bad: "The roadmap has been updated." Good: "Roadmap moved LTL launch from Q2 to Q3, citing FDIC review delays." Bad: "Loss forecasts were revised." Good: "Loss forecast revised up 20bps to 3.4% on weaker Q1 vintage performance."
 - Lead with "so what" and financial impact, not metadata
 - No duplicates across the two sections
