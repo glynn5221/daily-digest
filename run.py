@@ -20,35 +20,47 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
-CONFIG_PATH = SCRIPT_DIR / "config.json"
-STATE_PATH = SCRIPT_DIR / "state.json"
-LOG_PATH = SCRIPT_DIR / "run.log"
-FALLBACK_PATH = SCRIPT_DIR / "last-digest.md"
+
+
+def _resolve_paths(config_name="config.json"):
+    """Resolve config/state/log paths from a config filename."""
+    stem = Path(config_name).stem  # e.g. "config-role" from "config-role.json"
+    suffix = stem.replace("config", "").strip("-") if stem != "config" else ""
+    return {
+        "config": SCRIPT_DIR / config_name,
+        "state": SCRIPT_DIR / (f"state-{suffix}.json" if suffix else "state.json"),
+        "log": SCRIPT_DIR / (f"run-{suffix}.log" if suffix else "run.log"),
+        "fallback": SCRIPT_DIR / (f"last-digest-{suffix}.md" if suffix else "last-digest.md"),
+    }
+
+
+_LOG_PATH = None  # set by main()
 
 
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
-    with open(LOG_PATH, "a") as f:
-        f.write(line + "\n")
+    if _LOG_PATH:
+        with open(_LOG_PATH, "a") as f:
+            f.write(line + "\n")
 
 
-def load_config():
-    with open(CONFIG_PATH) as f:
+def load_config(path):
+    with open(path) as f:
         return json.load(f)
 
 
-def load_state():
+def load_state(path):
     try:
-        with open(STATE_PATH) as f:
+        with open(path) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {"run_count": 0}
 
 
-def save_state(state):
-    with open(STATE_PATH, "w") as f:
+def save_state(state, path):
+    with open(path, "w") as f:
         json.dump(state, f, indent=2)
 
 
@@ -638,6 +650,13 @@ def synthesize(config, state, airtable_data, slack_data, drive_data, bets_slack_
     today = datetime.now().strftime("%Y-%m-%d")
     prev_snapshot = json.dumps(state.get("snapshot", {}), indent=2) if mode == "DELTA" else "N/A"
 
+    digest = config.get("digest", {})
+    title = digest.get("title", "Daily Digest")
+    section_header = digest.get("section_header", "Top 20")
+    framing = digest.get("framing", "")
+    includes = digest.get("includes", "")
+    excludes = digest.get("excludes", "")
+
     prompt = f"""You are generating a daily intelligence digest for {config['user']['name']}, {config['user']['role']} at {config['user']['company']}.
 
 Today's date: {today}
@@ -648,40 +667,15 @@ Mode: {mode}
 {config['user']['company']} is a financial technology company. Business units: Cash App (consumer), Square (seller), Afterpay (BNPL), TIDAL (music), Bitkey (bitcoin).
 
 ## Vocabulary (use these terms when relevant)
-{', '.join(config['coverage']['vocabulary'])}
+{', '.join(config['coverage'].get('vocabulary', []))}
 
 ## CRITICAL: What this digest IS and IS NOT
 
-This digest covers Block's COMPANY-WIDE strategic bets and trajectory — the big moves that will define where Block goes over the next 1-3 years. The reader already gets separate daily coverage of Borrow, SFS, APCAC, Retro, and lending. DO NOT INCLUDE ANY OF THOSE TOPICS.
+{framing}
 
-EXPLICITLY EXCLUDED (the reader already has these covered):
-- Borrow, SFS, Square Financial Services, APCAC, Retro, lending, consumer loans
-- CECL, ANM, RAROC, RAS, EWI, loss rates, charge-off, delinquency
-- FDIC submissions, bank regulatory items specific to SFS
-- Anything about the Borrow product, lending portfolio, or loan performance
+{f"WHAT BELONGS:" + chr(10) + includes if includes else ""}
 
-WHAT BELONGS — Block's future beyond lending:
-- Neighborhoods / local commerce discovery
-- Autonomy / self-driving / fleet / delivery
-- Managerbot, Moneybot, AI agents that change how Block operates
-- Bitcoin: mining, custody, lightning, protocol, bitkey hardware wallet
-- Cash App Lite / international expansion — new countries, regulatory clearances
-- Cash App credit score, banking, savings (NOT lending)
-- Square GTM: field sales, enterprise, new seller verticals, GPV growth
-- Square org changes, platform evolution, competitive positioning
-- Afterpay/Clearpay integration, BNPL growth, international
-- TIDAL music strategy
-- Big wins, milestones, record metrics across any BU
-- Senior leadership moves, major reorgs, cultural shifts (Jack's directives)
-- Competitive threats: PayPal, Apple, Stripe, banks, neobanks
-- M&A, partnerships, strategic deals
-- Earnings, guidance, analyst sentiment, investor narrative
-- Macro shifts that affect Block's model
-
-DOES NOT BELONG:
-- Routine operational updates, team standups, sprint progress
-- A doc was modified with no substantive strategic content
-- ANY Borrow/SFS/APCAC/Retro/lending content (this is the most important rule)
+{f"EXPLICITLY EXCLUDED:" + chr(10) + excludes if excludes else ""}
 
 {"## Previous snapshot (for delta comparison)" + chr(10) + prev_snapshot if mode == "DELTA" else ""}
 
@@ -689,41 +683,39 @@ DOES NOT BELONG:
 
 IMPORTANT:
 1. Each raw data item below has a LINK field. When you reference an item in the digest, you MUST use that item's exact LINK value — do NOT swap links between items or fabricate URLs.
-2. Google Drive docs include their actual CONTENT. Read the content to determine what the document is about and what specifically was updated. Do NOT include a Drive doc in the digest just because it was recently modified — only include it if the content is substantively relevant. A doc titled "Q2 Forecast" that contains boilerplate or irrelevant content should be skipped.
+2. Google Drive docs include their actual CONTENT. Read the content to determine what the document is about and what specifically was updated. Do NOT include a Drive doc in the digest just because it was recently modified — only include it if the content is substantively relevant.
 
 ### Airtable Roadmap ({len(airtable_data.get('records', []))} records)
 {_format_airtable_for_prompt(airtable_data)}
 
-### Slack ({len(slack_data)} messages — keyword searches, key people's messages, company-wide signals)
+### Slack ({len(slack_data)} messages)
 {_format_slack_for_prompt(slack_data, max_chars=15000)}
 
-### Google Drive ({len(drive_data.get('docs', []))} docs — keyword searches, key people's edits, meeting notes, linked references)
+### Google Drive ({len(drive_data.get('docs', []))} docs)
 {_format_drive_for_prompt(drive_data, max_chars=25000)}
 
 ## Instructions
 
 Produce the digest in this exact format (Slack mrkdwn).
 
-*📊 Daily Digest — {today}* _(run {run_count + 1} · {mode.lower()})_
+*📊 {title} — {today}* _(run {run_count + 1} · {mode.lower()})_
 
-*🚀 Block Company Trajectory — Top 20*
+*{section_header}*
 
-[20 items. Each item should represent a signal about where Block is headed as a company. Think like a senior executive or board member: what are the 20 most important things happening across Block right now that affect the company's future competitive position, growth, and strategic direction?
-
-Rank by how much the item could move the needle for Block over the next 1-3 years. Items 1-5 should be the highest-magnitude signals. Cast a wide net across ALL of Block — Cash App, Square, Afterpay, TIDAL, Bitkey, corporate. Do NOT over-index on any single team or function.]
+[20 items ranked by impact magnitude.]
 
 ---
-_Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if drive_data.get('docs') else '❌'} · Meeting Notes ✅ · Ref-Follow ✅ · People ✅ · Sent by Claude_
+_Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if drive_data.get('docs') else '❌'} · Sent by Claude_
 
 Rules:
 - Each item format: [N]. 🔴/🟡/🟢 *<Item name>* (<source link>)  then 2-3 sentences with the update.
 - 🔴 = action today, 🟡 = monitor, 🟢 = positive signal
 - LINKS: Every item MUST include exactly one clickable link. Copy the EXACT URL from the LINK field of the raw data item you are referencing. Do NOT modify, guess, or fabricate URLs. Format as Slack mrkdwn: <URL|Slack>, <URL|Doc>, or <URL|Airtable>. If an item synthesizes multiple sources, use the link from the single most informative source item.
 - SPECIFICITY ON CHANGES: Never say "has been updated" or "has changed." Say WHAT specifically changed. Bad: "The roadmap has been updated." Good: "Roadmap moved LTL launch from Q2 to Q3, citing FDIC review delays." Bad: "Loss forecasts were revised." Good: "Loss forecast revised up 20bps to 3.4% on weaker Q1 vintage performance."
-- Lead with "so what" and strategic impact, not metadata
+- Lead with "so what" and impact, not metadata
 - No duplicates
-- Do NOT include items just because a document was recently modified — only if the content reveals a substantive strategic signal
-- STRATEGIC, NOT OPERATIONAL: Do not include granular operational updates (sprint progress, team standups, minor metric moves, routine process updates). Every item should pass the test: "Would a board member or senior executive care about this?" If the answer is no, skip it.
+- Do NOT include items just because a document was recently modified — only if the content reveals a substantive signal
+- Every item should pass the test: "Is this a meaningful update, not routine noise?" If no, skip it.
 - If {mode} is DELTA, only include genuine changes vs the previous snapshot — and state exactly what changed
 - Output ONLY the formatted digest, nothing else
 """
@@ -759,12 +751,25 @@ Rules:
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def main():
+    global _LOG_PATH
+
+    # Parse --config argument
+    config_name = "config.json"
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg == "--config" and i < len(sys.argv):
+            config_name = sys.argv[i + 1]
+        elif arg.startswith("--config="):
+            config_name = arg.split("=", 1)[1]
+
+    paths = _resolve_paths(config_name)
+    _LOG_PATH = paths["log"]
+
     start_time = datetime.now()
     log("=" * 60)
-    log("Daily Digest run started")
+    log(f"Daily Digest run started (config: {config_name})")
 
-    config = load_config()
-    state = load_state()
+    config = load_config(paths["config"])
+    state = load_state(paths["state"])
     run_count = state.get("run_count", 0)
     log(f"Run #{run_count + 1} | Mode: {'BASELINE' if run_count < 3 else 'DELTA'}")
 
@@ -850,9 +855,9 @@ def main():
 
     if not sent:
         log("Slack DM failed — saving to local file")
-        with open(FALLBACK_PATH, "w") as f:
+        with open(paths["fallback"], "w") as f:
             f.write(digest)
-        log(f"Saved to {FALLBACK_PATH}")
+        log(f"Saved to {paths['fallback']}")
 
     # Save state
     new_state = {
@@ -869,7 +874,7 @@ def main():
             "drive_docs": [{"name": d["name"], "author": d["author"]} for d in merged_drive.get("docs", [])]
         }
     }
-    save_state(new_state)
+    save_state(new_state, paths["state"])
 
     total_elapsed = (datetime.now() - start_time).total_seconds()
     log(f"Daily Digest complete in {total_elapsed:.1f}s")
