@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daily Digest — standalone runner.
-Fetches data from Airtable, Slack, and Google Drive via APIs,
+Fetches data from Airtable, Slack, and Google Drive via APIs (in parallel),
 pipes it to `claude -p` for synthesis, and sends the result as a Slack DM.
 
 No Claude Code permissions needed. Runs via cron.
@@ -14,6 +14,7 @@ import sys
 import urllib.request
 import urllib.parse
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -57,7 +58,6 @@ def fetch_airtable(config):
     base_id = config["sources"]["airtable"]["base_id"]
     fields = config["sources"]["airtable"]["fields"]
 
-    # Get Airtable API key from the claude config or from environment
     api_key = os.environ.get("AIRTABLE_API_KEY", "")
     if not api_key:
         try:
@@ -65,7 +65,6 @@ def fetch_airtable(config):
             if claude_cfg_path:
                 with open(claude_cfg_path) as f:
                     claude_cfg = json.load(f)
-                # Search for airtable API key in MCP server configs
                 for section in [claude_cfg, claude_cfg.get("projects", {}).get(str(Path.home()), {})]:
                     servers = section.get("mcpServers", {})
                     for name, srv in servers.items():
@@ -81,9 +80,8 @@ def fetch_airtable(config):
     if not api_key:
         return {"error": "No AIRTABLE_API_KEY found", "records": []}
 
-    log(f"  Fetching Airtable base {base_id}...")
+    log("  Fetching Airtable...")
 
-    # List tables
     try:
         req = urllib.request.Request(
             f"https://api.airtable.com/v0/meta/bases/{base_id}/tables",
@@ -94,39 +92,34 @@ def fetch_airtable(config):
     except Exception as e:
         return {"error": f"Failed to list tables: {e}", "records": []}
 
-    # Build a set of which fields exist in which table
     table_fields = {}
     for table in tables:
         table_fields[table["name"]] = {f["name"] for f in table.get("fields", [])}
 
-    all_records = []
-    for table in tables:
+    def _fetch_table(table):
         table_name = table["name"]
-        log(f"  Reading table: {table_name}")
-
-        # Only request fields that actually exist in this table
         available = table_fields.get(table_name, set())
         valid_fields = [f for f in fields if f in available]
-
         if valid_fields:
-            params = "&".join(
-                f"fields[]={urllib.parse.quote(f)}" for f in valid_fields
-            )
+            params = "&".join(f"fields[]={urllib.parse.quote(f)}" for f in valid_fields)
             url = f"https://api.airtable.com/v0/{base_id}/{urllib.parse.quote(table_name)}?{params}&pageSize=100"
         else:
-            # No matching fields — fetch all and let config filter later
             url = f"https://api.airtable.com/v0/{base_id}/{urllib.parse.quote(table_name)}?pageSize=100"
-
         try:
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
             resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
             records = resp.get("records", [])
-            for r in records:
-                rec = {"_table": table_name}
-                rec.update(r.get("fields", {}))
-                all_records.append(rec)
+            return [dict(_table=table_name, **r.get("fields", {})) for r in records]
         except Exception as e:
             log(f"  Warning: failed to read {table_name}: {e}")
+            return []
+
+    # Parallel table reads
+    all_records = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_table, t): t["name"] for t in tables}
+        for future in as_completed(futures):
+            all_records.extend(future.result())
 
     log(f"  Airtable: {len(all_records)} records from {len(tables)} tables")
     return {"records": all_records, "tables": [t["name"] for t in tables]}
@@ -134,116 +127,103 @@ def fetch_airtable(config):
 
 # ── Slack ─────────────────────────────────────────────────────────────────
 
-def _slack_search(token, workspace_id, queries, label="Slack"):
-    """Run a list of Slack search queries and return deduplicated messages."""
-    all_messages = []
+def _slack_search_batch(token, workspace_id, queries, label="Slack"):
+    """Run Slack searches in parallel and return deduplicated messages."""
 
-    for query in queries:
+    def _search_one(query):
         full_query = f"{query} after:yesterday"
-        log(f"  {label} search: {full_query}")
-
         search_params = {"query": full_query, "count": "20"}
         if workspace_id:
             search_params["team_id"] = workspace_id
         params = urllib.parse.urlencode(search_params)
         url = f"https://slack.com/api/search.messages?{params}"
-
         try:
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
             resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
-
             if not resp.get("ok"):
-                log(f"  Warning: {label} search failed: {resp.get('error', 'unknown')}")
-                continue
-
-            matches = resp.get("messages", {}).get("matches", [])
-            for m in matches:
+                return []
+            results = []
+            for m in resp.get("messages", {}).get("matches", []):
                 if m.get("bot_id") or m.get("subtype") == "bot_message":
                     continue
                 text = m.get("text", "").strip()
                 if not text or len(text) < 10:
                     continue
-                all_messages.append({
+                results.append({
                     "channel": m.get("channel", {}).get("name", "unknown"),
                     "user": m.get("username", "unknown"),
                     "text": text[:500],
                     "ts": m.get("ts", ""),
                     "query": query
                 })
-        except Exception as e:
-            log(f"  Warning: {label} search failed for '{query}': {e}")
+            return results
+        except Exception:
+            return []
+
+    all_messages = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [pool.submit(_search_one, q) for q in queries]
+        for future in as_completed(futures):
+            all_messages.extend(future.result())
 
     # Deduplicate by timestamp
     seen = set()
-    unique = []
-    for m in all_messages:
-        if m["ts"] not in seen:
-            seen.add(m["ts"])
-            unique.append(m)
-
+    unique = [m for m in all_messages if m["ts"] not in seen and not seen.add(m["ts"])]
     log(f"  {label}: {len(unique)} unique messages from {len(queries)} searches")
     return unique
 
 
 def fetch_slack(config):
-    """Search Slack for user's coverage area."""
     token = config["credentials"]["slack_token"]
     workspace_id = config["sources"]["slack"].get("workspace_id", "")
-    queries = config["coverage"]["slack_searches"]
-    return _slack_search(token, workspace_id, queries, "Slack")
+    return _slack_search_batch(token, workspace_id, config["coverage"]["slack_searches"], "Slack")
 
 
 def fetch_slack_company_bets(config):
-    """Search Slack for company-wide trajectory-changing initiatives."""
     bets = config.get("company_bets", {})
     if not bets or not bets.get("slack_searches"):
         return []
     token = config["credentials"]["slack_token"]
     workspace_id = config["sources"]["slack"].get("workspace_id", "")
-    return _slack_search(token, workspace_id, bets["slack_searches"], "Bets")
+    return _slack_search_batch(token, workspace_id, bets["slack_searches"], "Bets")
 
 
 # ── Google Drive ──────────────────────────────────────────────────────────
 
-def fetch_google_drive(config, override_terms=None, label="Drive"):
-    """Search Google Drive via API with OAuth refresh."""
+def _get_drive_access_token(config):
+    """Get a fresh Google Drive access token. Cached per run."""
     gd = config["sources"]["google_drive"]
-    terms = override_terms or config["coverage"]["drive_search_terms"]
-
-    # Get refresh token from keychain
     try:
         result = subprocess.run(
             ["security", "find-generic-password",
-             "-s", gd["keychain_service"],
-             "-a", gd["keychain_account"],
-             "-w"],
+             "-s", gd["keychain_service"], "-a", gd["keychain_account"], "-w"],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode != 0:
-            return {"error": "Keychain lookup failed", "docs": []}
+            return None
         creds = json.loads(result.stdout.strip())
-        refresh_token = creds["refresh_token"]
-    except Exception as e:
-        return {"error": f"Keychain error: {e}", "docs": []}
-
-    # Refresh access token
-    try:
         data = urllib.parse.urlencode({
             "client_id": gd["oauth_client_id"],
             "client_secret": gd["oauth_client_secret"],
-            "refresh_token": refresh_token,
+            "refresh_token": creds["refresh_token"],
             "grant_type": "refresh_token"
         }).encode()
         req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
         resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
-        access_token = resp["access_token"]
+        return resp["access_token"]
     except Exception as e:
-        return {"error": f"OAuth refresh failed: {e}", "docs": []}
+        log(f"  Warning: Drive OAuth failed: {e}")
+        return None
+
+
+def _drive_search_batch(access_token, terms, label="Drive"):
+    """Search Drive for multiple terms in parallel."""
+    if not access_token:
+        return {"error": "No access token", "docs": []}
 
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
-    all_docs = []
 
-    for term in terms:
+    def _search_one(term):
         query = f"modifiedTime>'{yesterday}' and fullText contains '{term}'"
         params = urllib.parse.urlencode({
             "q": query,
@@ -252,18 +232,15 @@ def fetch_google_drive(config, override_terms=None, label="Drive"):
             "pageSize": "10"
         })
         url = f"https://www.googleapis.com/drive/v3/files?{params}"
-        log(f"  {label} search: {term}")
-
         try:
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
             resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
-            files = resp.get("files", [])
-            for f in files:
+            docs = []
+            for f in resp.get("files", []):
                 name = f.get("name", "")
-                # Skip meeting templates, 1:1 docs, calendar invites
                 if any(skip in name.lower() for skip in ["1:1", "1-1", "meeting notes template", "calendar"]):
                     continue
-                all_docs.append({
+                docs.append({
                     "name": name,
                     "author": f.get("lastModifyingUser", {}).get("displayName", "unknown"),
                     "modified": f.get("modifiedTime", ""),
@@ -271,17 +248,18 @@ def fetch_google_drive(config, override_terms=None, label="Drive"):
                     "id": f.get("id", ""),
                     "search_term": term
                 })
-        except Exception as e:
-            log(f"  Warning: Drive search failed for '{term}': {e}")
+            return docs
+        except Exception:
+            return []
 
-    # Deduplicate by doc ID
+    all_docs = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_search_one, t) for t in terms]
+        for future in as_completed(futures):
+            all_docs.extend(future.result())
+
     seen = set()
-    unique = []
-    for d in all_docs:
-        if d["id"] not in seen:
-            seen.add(d["id"])
-            unique.append(d)
-
+    unique = [d for d in all_docs if d["id"] not in seen and not seen.add(d["id"])]
     log(f"  {label}: {len(unique)} unique docs from {len(terms)} searches")
     return {"docs": unique}
 
@@ -289,25 +267,14 @@ def fetch_google_drive(config, override_terms=None, label="Drive"):
 # ── Send Slack DM ─────────────────────────────────────────────────────────
 
 def send_slack_dm(config, message):
-    """Send a Slack DM via API."""
     token = config["credentials"]["slack_token"]
     channel = config["user"]["slack_id"]
-
-    data = json.dumps({
-        "channel": channel,
-        "text": message,
-        "mrkdwn": True
-    }).encode()
-
+    data = json.dumps({"channel": channel, "text": message, "mrkdwn": True}).encode()
     req = urllib.request.Request(
         "https://slack.com/api/chat.postMessage",
         data=data,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     )
-
     try:
         resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
         if resp.get("ok"):
@@ -324,11 +291,9 @@ def send_slack_dm(config, message):
 # ── Claude synthesis ──────────────────────────────────────────────────────
 
 def synthesize(config, state, airtable_data, slack_data, drive_data, bets_slack_data, bets_drive_data):
-    """Pass raw data to claude -p for synthesis."""
     run_count = state.get("run_count", 0)
     mode = "BASELINE" if run_count < 3 else "DELTA"
     today = datetime.now().strftime("%Y-%m-%d")
-
     prev_snapshot = json.dumps(state.get("snapshot", {}), indent=2) if mode == "DELTA" else "N/A"
 
     prompt = f"""You are generating a daily intelligence digest for {config['user']['name']}, {config['user']['role']} at {config['user']['company']}.
@@ -374,7 +339,7 @@ Mode: {mode}
 
 ## Instructions
 
-Produce the digest in this exact format (Slack mrkdwn):
+Produce the digest in this exact format (Slack mrkdwn). You MUST include ALL THREE sections.
 
 *📊 Daily Digest — {today}* _(run {run_count + 1} · {mode.lower()})_
 
@@ -392,7 +357,7 @@ Produce the digest in this exact format (Slack mrkdwn):
 
 *🚀 Top 5: Company Trajectory*
 
-[up to 5 items — trajectory-changing initiatives and big bets across the ENTIRE company, NOT limited to the user's coverage area. Use your judgment broadly. The configured search terms are just starting points — surface anything from ANY of the raw data that could meaningfully change Block's trajectory over the next 1-3 years. Examples: international expansion (Cash App Lite), new financial products (credit score, banking), major sales motion shifts (field sales, enterprise GTM), AI/ML bets that change how the company operates or competes, bitcoin/crypto strategic moves, strategic partnerships or acquisitions, major org restructuring or senior leadership changes, competitive threats that force a response, new regulatory regimes, large customer segment expansions. Cast a wide net — if it could move the stock price or fundamentally alter Block's competitive position, it belongs here.]
+[MANDATORY — up to 5 items. Trajectory-changing initiatives and big bets across the ENTIRE company, NOT limited to the user's coverage area. Use your judgment broadly. The configured search terms are just starting points — surface anything from ANY of the raw data that could meaningfully change Block's trajectory over the next 1-3 years. Examples: international expansion (Cash App Lite), new financial products (credit score, banking), major sales motion shifts (field sales, enterprise GTM), AI/ML bets that change how the company operates or competes, bitcoin/crypto strategic moves, strategic partnerships or acquisitions, major org restructuring or senior leadership changes, competitive threats that force a response, new regulatory regimes, large customer segment expansions. Cast a wide net — if it could move the stock price or fundamentally alter Block's competitive position, it belongs here.]
 
 ---
 _Sources: Airtable {'✅' if not airtable_data.get('error') else '❌'} · Slack {'✅' if slack_data else '❌'} · Drive {'✅' if not drive_data.get('error') else '❌'} · Sent by Claude_
@@ -402,7 +367,8 @@ Rules:
 - 🔴 = action today, 🟡 = monitor, 🟢 = positive signal
 - Lead with "so what" and financial impact, not metadata
 - No duplicates across ANY of the three sections
-- Company Trajectory items should be DIFFERENT from Financial Impact and On Your Radar — broader, more strategic, company-wide. They can come from ANY raw data source, not just the company bets searches. If a Slack message about a coverage-area topic also reveals a company-changing bet, put it in Trajectory.
+- Company Trajectory items should be DIFFERENT from Financial Impact and On Your Radar — broader, more strategic, company-wide. They can come from ANY raw data source, not just the company bets searches.
+- ALL THREE SECTIONS ARE MANDATORY. Do not skip Company Trajectory even if data is sparse — use your best judgment from whatever signals are available.
 - If {mode} is DELTA, only include genuine changes vs the previous snapshot
 - Output ONLY the formatted digest, nothing else
 """
@@ -418,7 +384,6 @@ Rules:
             return None
         return result.stdout.strip()
     except FileNotFoundError:
-        # Try full path
         for path in ["/usr/local/bin/claude", str(Path.home() / ".local/bin/claude"), "/opt/homebrew/bin/claude"]:
             try:
                 result = subprocess.run(
@@ -439,6 +404,7 @@ Rules:
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def main():
+    start_time = datetime.now()
     log("=" * 60)
     log("Daily Digest run started")
 
@@ -447,25 +413,34 @@ def main():
     run_count = state.get("run_count", 0)
     log(f"Run #{run_count + 1} | Mode: {'BASELINE' if run_count < 3 else 'DELTA'}")
 
-    # Fetch all data
-    log("Fetching Airtable...")
-    airtable_data = fetch_airtable(config)
+    # Get Drive OAuth token once (shared across both Drive fetches)
+    log("Refreshing Drive OAuth token...")
+    drive_token = _get_drive_access_token(config)
+
+    # Fetch ALL data sources in parallel
+    log("Fetching all sources in parallel...")
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        f_airtable = pool.submit(fetch_airtable, config)
+        f_slack = pool.submit(fetch_slack, config)
+        f_bets_slack = pool.submit(fetch_slack_company_bets, config)
+
+        drive_terms = config["coverage"]["drive_search_terms"]
+        bets_drive_terms = config.get("company_bets", {}).get("drive_search_terms", [])
+        f_drive = pool.submit(_drive_search_batch, drive_token, drive_terms, "Drive")
+        f_bets_drive = pool.submit(_drive_search_batch, drive_token, bets_drive_terms, "Bets Drive")
+
+        airtable_data = f_airtable.result()
+        slack_data = f_slack.result()
+        bets_slack_data = f_bets_slack.result()
+        drive_data = f_drive.result()
+        bets_drive_data = f_bets_drive.result()
+
     airtable_ok = "error" not in airtable_data
-
-    log("Fetching Slack (coverage area)...")
-    slack_data = fetch_slack(config)
     slack_ok = len(slack_data) > 0
-
-    log("Fetching Slack (company bets)...")
-    bets_slack_data = fetch_slack_company_bets(config)
-
-    log("Fetching Google Drive (coverage area)...")
-    drive_data = fetch_google_drive(config)
     drive_ok = "error" not in drive_data
 
-    log("Fetching Google Drive (company bets)...")
-    bets_drive_terms = config.get("company_bets", {}).get("drive_search_terms", [])
-    bets_drive_data = fetch_google_drive(config, override_terms=bets_drive_terms, label="Bets Drive") if bets_drive_terms else {"docs": []}
+    fetch_elapsed = (datetime.now() - start_time).total_seconds()
+    log(f"All fetches complete in {fetch_elapsed:.1f}s — AT:{len(airtable_data.get('records',[]))} SL:{len(slack_data)} BetsSL:{len(bets_slack_data)} DR:{len(drive_data.get('docs',[]))} BetsDR:{len(bets_drive_data.get('docs',[]))}")
 
     # Synthesize with Claude
     digest = synthesize(config, state, airtable_data, slack_data, drive_data, bets_slack_data, bets_drive_data)
@@ -474,7 +449,8 @@ def main():
         log("ERROR: Synthesis failed — no digest produced")
         sys.exit(1)
 
-    log(f"Digest generated ({len(digest)} chars)")
+    synth_elapsed = (datetime.now() - start_time).total_seconds()
+    log(f"Digest generated ({len(digest)} chars) in {synth_elapsed:.1f}s total")
 
     # Send Slack DM
     sent = send_slack_dm(config, digest)
@@ -491,8 +467,8 @@ def main():
         "last_run_date": datetime.now().strftime("%Y-%m-%d"),
         "source_status": {
             "airtable": "success" if airtable_ok else "error",
-            "slack": "success via curl" if slack_ok else "error",
-            "google_drive": "success via curl" if drive_ok else "error"
+            "slack": "success" if slack_ok else "error",
+            "google_drive": "success" if drive_ok else "error"
         },
         "snapshot": {
             "airtable": airtable_data,
@@ -501,8 +477,9 @@ def main():
         }
     }
     save_state(new_state)
-    log("State saved")
-    log("Daily Digest run complete")
+
+    total_elapsed = (datetime.now() - start_time).total_seconds()
+    log(f"Daily Digest complete in {total_elapsed:.1f}s")
     log("=" * 60)
 
 
