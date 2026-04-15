@@ -780,16 +780,16 @@ def main():
     log(f"Daily Digest run started (config: {config_name})")
 
     # Wait for network (handles LaunchAgent catch-up after sleep)
-    for attempt in range(6):
+    for attempt in range(18):
         try:
             urllib.request.urlopen("https://slack.com/api/api.test", timeout=5)
             break
         except Exception:
-            if attempt < 5:
-                log(f"  Network not ready, retrying in 10s (attempt {attempt + 1}/6)...")
+            if attempt < 17:
+                log(f"  Network not ready, retrying in 10s (attempt {attempt + 1}/18)...")
                 time.sleep(10)
             else:
-                log("  WARNING: Network still not ready after 60s, proceeding anyway")
+                log("  WARNING: Network still not ready after 3 min, proceeding anyway")
 
     config = load_config(paths["config"])
     state = load_state(paths["state"])
