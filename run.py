@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -40,10 +41,11 @@ _LOG_PATH = None  # set by main()
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line, flush=True)
     if _LOG_PATH:
         with open(_LOG_PATH, "a") as f:
             f.write(line + "\n")
+    else:
+        print(line, flush=True)
 
 
 def load_config(path):
@@ -209,21 +211,35 @@ def fetch_slack_company_bets(config):
 # ── Google Drive ──────────────────────────────────────────────────────────
 
 def _get_drive_access_token(config):
-    """Get a fresh Google Drive access token. Cached per run."""
+    """Get a fresh Google Drive access token.
+    Reads refresh_token from config first (reliable), falls back to keychain.
+    """
     gd = config["sources"]["google_drive"]
+    refresh_token = gd.get("refresh_token")
+
+    # Fallback: try keychain if no refresh_token in config
+    if not refresh_token:
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", gd["keychain_service"], "-a", gd["keychain_account"], "-w"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                creds = json.loads(result.stdout.strip())
+                refresh_token = creds.get("refresh_token")
+        except Exception as e:
+            log(f"  Warning: Keychain access failed: {e}")
+
+    if not refresh_token:
+        log("  Warning: No refresh token available (config or keychain)")
+        return None
+
     try:
-        result = subprocess.run(
-            ["security", "find-generic-password",
-             "-s", gd["keychain_service"], "-a", gd["keychain_account"], "-w"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode != 0:
-            return None
-        creds = json.loads(result.stdout.strip())
         data = urllib.parse.urlencode({
             "client_id": gd["oauth_client_id"],
             "client_secret": gd["oauth_client_secret"],
-            "refresh_token": creds["refresh_token"],
+            "refresh_token": refresh_token,
             "grant_type": "refresh_token"
         }).encode()
         req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
@@ -721,31 +737,26 @@ Rules:
 """
 
     log("  Running claude -p for synthesis...")
-    try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--model", "sonnet"],
-            capture_output=True, text=True, timeout=600
-        )
-        if result.returncode != 0:
-            log(f"  claude -p failed: {result.stderr[:500]}")
+    # Use absolute path — LaunchAgent/cron PATH doesn't include /usr/local/bin
+    claude_paths = ["/usr/local/bin/claude", "claude",
+                    str(Path.home() / ".local/bin/claude"), "/opt/homebrew/bin/claude"]
+    for claude_bin in claude_paths:
+        try:
+            result = subprocess.run(
+                [claude_bin, "-p", prompt, "--model", "sonnet"],
+                capture_output=True, text=True, timeout=600
+            )
+            if result.returncode != 0:
+                log(f"  claude -p failed ({claude_bin}): {result.stderr[:500]}")
+                return None
+            return result.stdout.strip()
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            log("  ERROR: claude -p timed out after 10 minutes")
             return None
-        return result.stdout.strip()
-    except FileNotFoundError:
-        for path in ["/usr/local/bin/claude", str(Path.home() / ".local/bin/claude"), "/opt/homebrew/bin/claude"]:
-            try:
-                result = subprocess.run(
-                    [path, "-p", prompt, "--model", "sonnet"],
-                    capture_output=True, text=True, timeout=600
-                )
-                if result.returncode == 0:
-                    return result.stdout.strip()
-            except FileNotFoundError:
-                continue
-        log("  ERROR: claude CLI not found")
-        return None
-    except subprocess.TimeoutExpired:
-        log("  ERROR: claude -p timed out after 5 minutes")
-        return None
+    log("  ERROR: claude CLI not found in any known path")
+    return None
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
@@ -767,6 +778,18 @@ def main():
     start_time = datetime.now()
     log("=" * 60)
     log(f"Daily Digest run started (config: {config_name})")
+
+    # Wait for network (handles LaunchAgent catch-up after sleep)
+    for attempt in range(6):
+        try:
+            urllib.request.urlopen("https://slack.com/api/api.test", timeout=5)
+            break
+        except Exception:
+            if attempt < 5:
+                log(f"  Network not ready, retrying in 10s (attempt {attempt + 1}/6)...")
+                time.sleep(10)
+            else:
+                log("  WARNING: Network still not ready after 60s, proceeding anyway")
 
     config = load_config(paths["config"])
     state = load_state(paths["state"])
