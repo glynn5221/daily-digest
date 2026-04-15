@@ -609,19 +609,70 @@ def send_slack_dm(config, message):
         return False
 
 
+def _diff_airtable(current_data, prev_snapshot):
+    """Compare current Airtable records against previous snapshot.
+    Returns only new, changed, and removed records with change annotations."""
+    prev_records = prev_snapshot.get("airtable", {}).get("records", [])
+    curr_records = current_data.get("records", [])
+
+    # Index by _url (unique per record)
+    prev_by_url = {r.get("_url", ""): r for r in prev_records if r.get("_url")}
+    curr_by_url = {r.get("_url", ""): r for r in curr_records if r.get("_url")}
+
+    changes = []
+
+    # New records
+    for url, rec in curr_by_url.items():
+        if url not in prev_by_url:
+            rec["_change"] = "NEW"
+            changes.append(rec)
+
+    # Changed records
+    for url, rec in curr_by_url.items():
+        if url in prev_by_url:
+            prev = prev_by_url[url]
+            diffs = []
+            all_keys = set(list(rec.keys()) + list(prev.keys()))
+            for k in all_keys:
+                if k.startswith("_"):
+                    continue
+                old_val = prev.get(k)
+                new_val = rec.get(k)
+                if old_val != new_val:
+                    diffs.append(f"{k}: {json.dumps(old_val, default=str)} → {json.dumps(new_val, default=str)}")
+            if diffs:
+                rec["_change"] = "CHANGED: " + "; ".join(diffs[:5])
+                changes.append(rec)
+
+    # Removed records
+    for url, rec in prev_by_url.items():
+        if url not in curr_by_url:
+            rec["_change"] = "REMOVED"
+            changes.append(rec)
+
+    return changes
+
+
 # ── Prompt formatting helpers ─────────────────────────────────────────────
 
-def _format_airtable_for_prompt(airtable_data, max_chars=15000):
+def _format_airtable_for_prompt(records, max_chars=15000):
+    """Format Airtable records for prompt. Accepts either full data dict or pre-diffed list."""
+    if isinstance(records, dict):
+        record_list = records.get("records", [])
+    else:
+        record_list = records
     lines = []
-    for r in airtable_data.get("records", []):
+    for r in record_list:
         name = r.get("Name", r.get("_table", "unnamed"))
         url = r.get("_url", "")
-        fields = {k: v for k, v in r.items() if k not in ("_table", "_url")}
-        line = f"- {name} | LINK: {url} | {json.dumps(fields, default=str)}"
+        change = r.get("_change", "")
+        fields = {k: v for k, v in r.items() if not k.startswith("_")}
+        change_tag = f" [{change}]" if change else ""
+        line = f"- {name}{change_tag} | LINK: {url} | {json.dumps(fields, default=str)}"
         lines.append(line)
         if sum(len(l) for l in lines) > max_chars:
             break
-    return "\n".join(lines) if lines else "(no records)"
+    return "\n".join(lines) if lines else "(no records with changes)"
 
 
 def _format_slack_for_prompt(messages, max_chars=12000):
@@ -664,7 +715,14 @@ def synthesize(config, state, airtable_data, slack_data, drive_data, bets_slack_
     run_count = state.get("run_count", 0)
     mode = "BASELINE" if run_count < 3 else "DELTA"
     today = datetime.now().strftime("%Y-%m-%d")
-    prev_snapshot = json.dumps(state.get("snapshot", {}), indent=2) if mode == "DELTA" else "N/A"
+
+    # Diff Airtable records in DELTA mode — only pass changes to Claude
+    if mode == "DELTA":
+        at_changes = _diff_airtable(airtable_data, state.get("snapshot", {}))
+        log(f"  Airtable diff: {len(at_changes)} changed records (from {len(airtable_data.get('records', []))} total)")
+        airtable_for_prompt = at_changes
+    else:
+        airtable_for_prompt = airtable_data
 
     digest = config.get("digest", {})
     title = digest.get("title", "Daily Digest")
@@ -693,16 +751,15 @@ Mode: {mode}
 
 {f"EXPLICITLY EXCLUDED:" + chr(10) + excludes if excludes else ""}
 
-{"## Previous snapshot (for delta comparison)" + chr(10) + prev_snapshot if mode == "DELTA" else ""}
-
 ## RAW DATA
 
 IMPORTANT:
 1. Each raw data item below has a LINK field. When you reference an item in the digest, you MUST use that item's exact LINK value — do NOT swap links between items or fabricate URLs.
 2. Google Drive docs include their actual CONTENT. Read the content to determine what the document is about and what specifically was updated. Do NOT include a Drive doc in the digest just because it was recently modified — only include it if the content is substantively relevant.
 
-### Airtable Roadmap ({len(airtable_data.get('records', []))} records)
-{_format_airtable_for_prompt(airtable_data)}
+### Airtable Roadmap {"Changes" if mode == "DELTA" else ""} ({len(airtable_for_prompt) if isinstance(airtable_for_prompt, list) else len(airtable_for_prompt.get('records', []))} {"changed records" if mode == "DELTA" else "records"})
+{_format_airtable_for_prompt(airtable_for_prompt)}
+{"NOTE: Each record above is tagged [NEW], [CHANGED: field: old → new], or [REMOVED]. Focus on what specifically changed." if mode == "DELTA" else ""}
 
 ### Slack ({len(slack_data)} messages)
 {_format_slack_for_prompt(slack_data, max_chars=15000)}
