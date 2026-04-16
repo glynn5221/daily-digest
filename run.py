@@ -836,17 +836,24 @@ def main():
     log("=" * 60)
     log(f"Daily Digest run started (config: {config_name})")
 
-    # Wait for network (handles LaunchAgent catch-up after sleep)
-    for attempt in range(18):
+    # Wait for network (handles LaunchAgent catch-up after sleep).
+    # Uses wall-clock deadline so a single check per wake cycle doesn't burn through retries.
+    network_deadline = time.time() + 300  # 5 min max wall-clock
+    attempt = 0
+    while True:
         try:
-            urllib.request.urlopen("https://slack.com/api/api.test", timeout=5)
+            urllib.request.urlopen("https://slack.com/api/api.test", timeout=10)
+            if attempt > 0:
+                log(f"  Network ready after {attempt} attempt(s)")
             break
         except Exception:
-            if attempt < 17:
-                log(f"  Network not ready, retrying in 10s (attempt {attempt + 1}/18)...")
-                time.sleep(10)
-            else:
-                log("  WARNING: Network still not ready after 3 min, proceeding anyway")
+            remaining = network_deadline - time.time()
+            if remaining <= 0:
+                log("  WARNING: Network still not ready after 5 min wall-clock, proceeding anyway")
+                break
+            attempt += 1
+            log(f"  Network not ready, retrying in 15s (attempt {attempt}, {int(remaining)}s remaining)...")
+            time.sleep(15)
 
     config = load_config(paths["config"])
     state = load_state(paths["state"])
@@ -919,6 +926,12 @@ def main():
     drive_ok = len(merged_drive.get("docs", [])) > 0
 
     log(f"Merged totals — SL:{len(merged_slack)} DR:{len(merged_drive.get('docs',[]))}")
+
+    # Abort if network was down and we have nothing to synthesize
+    airtable_records = len(airtable_data.get("records", []))
+    if not slack_ok and not drive_ok and airtable_records == 0:
+        log("ERROR: All sources returned 0 results — network was down. Aborting, will retry next wake.")
+        sys.exit(1)
 
     # Synthesize with Claude
     digest = synthesize(config, state, airtable_data, merged_slack, merged_drive, [], {"docs": []})
