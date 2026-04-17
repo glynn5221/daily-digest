@@ -797,22 +797,34 @@ Rules:
     # Use absolute path — LaunchAgent/cron PATH doesn't include /usr/local/bin
     claude_paths = ["/usr/local/bin/claude", "claude",
                     str(Path.home() / ".local/bin/claude"), "/opt/homebrew/bin/claude"]
-    for claude_bin in claude_paths:
+    claude_bin = next((p for p in claude_paths if Path(p).exists() or p == "claude"), None)
+    if not claude_bin:
+        log("  ERROR: claude CLI not found in any known path")
+        return None
+
+    # Retry up to 3 times — claude can fail on early wake (auth not restored yet)
+    for attempt in range(3):
         try:
             result = subprocess.run(
                 [claude_bin, "-p", prompt, "--model", "sonnet"],
                 capture_output=True, text=True, timeout=600
             )
-            if result.returncode != 0:
-                log(f"  claude -p failed ({claude_bin}): {result.stderr[:500]}")
-                return None
-            return result.stdout.strip()
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+            err = (result.stderr or result.stdout or "no output")[:300]
+            log(f"  claude -p attempt {attempt+1} failed (exit {result.returncode}): {err}")
+            if attempt < 2:
+                log(f"  Retrying in 30s...")
+                time.sleep(30)
         except FileNotFoundError:
-            continue
-        except subprocess.TimeoutExpired:
-            log("  ERROR: claude -p timed out after 10 minutes")
+            log(f"  ERROR: claude CLI not found at {claude_bin}")
             return None
-    log("  ERROR: claude CLI not found in any known path")
+        except subprocess.TimeoutExpired:
+            log(f"  ERROR: claude -p timed out (attempt {attempt+1})")
+            if attempt < 2:
+                time.sleep(30)
+
+    log("  ERROR: claude -p failed after 3 attempts")
     return None
 
 
@@ -854,6 +866,9 @@ def main():
             attempt += 1
             log(f"  Network not ready, retrying in 15s (attempt {attempt}, {int(remaining)}s remaining)...")
             time.sleep(15)
+
+    # Extra 20s after network is ready — gives claude auth/keychain time to restore after sleep
+    time.sleep(20)
 
     config = load_config(paths["config"])
     state = load_state(paths["state"])
