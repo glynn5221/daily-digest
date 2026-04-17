@@ -844,6 +844,15 @@ def main():
     paths = _resolve_paths(config_name)
     _LOG_PATH = paths["log"]
 
+    # Once-per-day guard: skip if already ran successfully today
+    # (RunAtLoad fires on every login; we only want one digest per calendar day)
+    try:
+        _quick_state = json.loads(paths["state"].read_text())
+        if _quick_state.get("last_run_date") == datetime.now().strftime("%Y-%m-%d"):
+            sys.exit(0)  # Already ran today — exit silently
+    except Exception:
+        pass
+
     start_time = datetime.now()
     log("=" * 60)
     log(f"Daily Digest run started (config: {config_name})")
